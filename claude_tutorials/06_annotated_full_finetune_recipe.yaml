@@ -1,0 +1,424 @@
+# ==============================================================================
+# ANNOTATED: Full Fine-Tuning Recipe - Train All Parameters (Distributed)
+# ==============================================================================
+# Source: recipes/configs/llama3_1/8B_full.yaml
+#
+# **WHAT**: Full parameter fine-tuning trains ALL 8 billion parameters
+#           (vs. LoRA which trains ~6M adapter parameters)
+#
+# **WHY**:  Maximum model capacity and quality:
+#           - LoRA: ~95-98% of full fine-tuning quality
+#           - Full: 100% quality (gold standard)
+#           - Use when: Quality critical, have resources
+#
+# **HOW**:  Requires significant resources:
+#           - Memory: ~80GB for 8B model (4× GPUs with 24GB each)
+#           - Time: Slower than LoRA (more params to update)
+#           - Data: More data recommended (avoid overfitting)
+#
+# **KEY DIFFERENCES FROM LORA**:
+#   1. model._component_: llama3_1_8b (not lora_llama3_1_8b)
+#   2. All parameters trainable (not just adapters)
+#   3. Requires distributed training (multiple GPUs)
+#   4. Lower learning rate (2e-5 vs. 3e-4 for LoRA)
+#   5. More memory optimizations needed
+#
+# **RECIPE ENTRY POINT**: recipes/full_finetune_distributed.py
+# ==============================================================================
+
+
+output_dir: /tmp/torchtune/llama3_1_8B/full
+
+
+# ==============================================================================
+# SECTION 1: Tokenizer (Identical across all recipes)
+# ==============================================================================
+tokenizer:
+  _component_: torchtune.models.llama3.llama3_tokenizer
+  path: /tmp/Meta-Llama-3.1-8B-Instruct/original/tokenizer.model
+  max_seq_len: null
+
+
+# ==============================================================================
+# SECTION 2: Dataset with Train/Val Split
+# ==============================================================================
+# **NEW**: Validation set for monitoring overfitting
+#          More important in full fine-tuning (higher capacity)
+# ==============================================================================
+dataset:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  packed: False
+  split: train[:95%]  # Use 95% for training
+
+seed: null
+shuffle: True
+
+# --------------------------------------------------------------------------
+# Validation Configuration
+# --------------------------------------------------------------------------
+# **WHY VALIDATION**: Full fine-tuning can overfit more easily than LoRA
+# **USAGE**: Set run_val_every_n_steps to enable periodic validation
+# --------------------------------------------------------------------------
+run_val_every_n_steps: null  # Set to 100 to validate every 100 steps
+
+dataset_val:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  split: train[95%:]  # Use last 5% for validation
+
+batch_size_val: ${batch_size}  # Use same batch size as training
+
+
+# ==============================================================================
+# SECTION 3: Model Configuration - NO LORA!
+# ==============================================================================
+# **CRITICAL DIFFERENCE**: Using base model (no adapters)
+#
+# **WHAT HAPPENS**:
+# 1. Full Llama 3.1 8B model created
+# 2. ALL parameters set to requires_grad=True
+# 3. No LoRA layers added
+# 4. All 8,030,261,248 parameters trainable!
+#
+# **MEMORY IMPACT**:
+# Model weights: 16 GB (bf16)
+# Gradients: 16 GB (bf16)
+# Optimizer states (Adam): 32 GB (fp32, 2 states per param)
+# Activations: ~16 GB
+# Total: ~80 GB (need 4× A100 24GB or 2× A100 80GB)
+# ==============================================================================
+model:
+  # --------------------------------------------------------------------------
+  # _component_: Base model (NOT LoRA variant!)
+  # --------------------------------------------------------------------------
+  # **COMPARISON**:
+  # LoRA: torchtune.models.llama3_1.lora_llama3_1_8b
+  # Full: torchtune.models.llama3_1.llama3_1_8b  ← No LoRA!
+  #
+  # **IMPLICATION**: No lora_rank, lora_alpha, etc. parameters
+  #                  Model is just the architecture
+  # --------------------------------------------------------------------------
+  _component_: torchtune.models.llama3_1.llama3_1_8b
+
+  # **NOTE**: No LoRA parameters! Model created with standard nn.Linear layers
+
+
+# ==============================================================================
+# SECTION 4: Checkpointer (Same format, different usage)
+# ==============================================================================
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Meta-Llama-3.1-8B-Instruct/
+  checkpoint_files: [
+    model-00001-of-00004.safetensors,
+    model-00002-of-00004.safetensors,
+    model-00003-of-00004.safetensors,
+    model-00004-of-00004.safetensors
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: False
+
+# **NOTE**: No save_adapter_weights_only (doesn't apply to full fine-tuning)
+
+
+# ==============================================================================
+# SECTION 5: Training Configuration
+# ==============================================================================
+# **KEY DIFFERENCES FROM LORA**:
+# 1. Smaller learning rate (2e-5 vs. 3e-4)
+# 2. Smaller batch size (memory constrained)
+# 3. Less gradient accumulation (distributed across GPUs)
+# ==============================================================================
+batch_size: 2  # Per GPU! Total = 2 × num_GPUs
+epochs: 1
+
+
+# ==============================================================================
+# SECTION 6: Optimizer - LOWER LEARNING RATE!
+# ==============================================================================
+# **CRITICAL**: Full fine-tuning uses 10-15× lower LR than LoRA
+#
+# **WHY LOWER LR**:
+# - LoRA starts from zero (large steps OK)
+# - Full fine-tuning starts from pretrained (small adjustments needed)
+# - Too high LR → catastrophic forgetting
+#
+# **TYPICAL LEARNING RATES**:
+# - Full fine-tuning: 1e-5 to 2e-5
+# - LoRA: 1e-4 to 5e-4
+# - From scratch: 3e-4 to 6e-4
+# ==============================================================================
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 2e-5  # ← 15× lower than LoRA!
+  fused: True  # Use fused kernel for speed
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+max_steps_per_epoch: null
+clip_grad_norm: null
+compile: False  # torch.compile for 10-30% speedup
+
+# --------------------------------------------------------------------------
+# Advanced Memory Optimization: Optimizer in Backward
+# --------------------------------------------------------------------------
+# **WHAT**: Fuse optimizer step with backward pass
+# **WHY**: Saves memory by not storing gradients
+# **REQUIREMENT**: gradient_accumulation_steps must be 1
+# **TYPICAL**: False (more flexible), True (if memory critical)
+# --------------------------------------------------------------------------
+optimizer_in_bwd: False
+
+gradient_accumulation_steps: 1  # Distributed across GPUs
+
+
+# ==============================================================================
+# SECTION 7: Distributed Training Environment
+# ==============================================================================
+# **LAUNCHING**:
+# ```bash
+# tune run --nproc_per_node 4 full_finetune_distributed \
+#     --config llama3_1/8B_full
+# ```
+#
+# **WHAT HAPPENS**:
+# 1. torchrun spawns 4 processes (one per GPU)
+# 2. Model sharded across GPUs using FSDP
+# 3. Each GPU processes different batch
+# 4. Gradients synchronized across GPUs
+# 5. Weights updated consistently
+# ==============================================================================
+device: cuda
+
+
+# ==============================================================================
+# SECTION 8: Memory Management - CRITICAL FOR FULL FINE-TUNING
+# ==============================================================================
+# **ALL OPTIMIZATIONS RECOMMENDED** (unlike LoRA where some are optional)
+# ==============================================================================
+
+# --------------------------------------------------------------------------
+# Activation Checkpointing: ESSENTIAL
+# --------------------------------------------------------------------------
+# **MEMORY SAVINGS**: ~40% reduction in activations
+# **COST**: ~20% slower (recomputation)
+# **RECOMMENDATION**: Always True for full fine-tuning
+# --------------------------------------------------------------------------
+enable_activation_checkpointing: True
+
+# --------------------------------------------------------------------------
+# Activation Offloading: Use if OOM even with checkpointing
+# --------------------------------------------------------------------------
+enable_activation_offloading: False
+
+# --------------------------------------------------------------------------
+# Custom Sharded Layers: For models with large vocab
+# --------------------------------------------------------------------------
+# **WHAT**: Shard specific layers separately
+# **WHY**: Embedding and output layers are often largest (vocab_size × embed_dim)
+# **EXAMPLE**: For Llama 3.1 (vocab=128K, embed=4096)
+#              Embedding: 128K × 4096 × 2 bytes = 1 GB
+#              Sharding across 4 GPUs: 256 MB per GPU
+# --------------------------------------------------------------------------
+custom_sharded_layers: ['tok_embeddings', 'output']
+
+
+# ==============================================================================
+# SECTION 9: Precision
+# ==============================================================================
+# **FULL FINE-TUNING PRECISION OPTIONS**:
+#
+# 1. **bf16** (recommended):
+#    - Activations: bf16
+#    - Gradients: bf16
+#    - Optimizer states: fp32 (internally)
+#    - Memory: ~40% savings vs. fp32
+#    - Quality: Nearly identical to fp32
+#
+# 2. **fp32** (if bf16 not supported):
+#    - Everything in fp32
+#    - Highest precision
+#    - 2× memory usage
+#
+# 3. **fp16** (not recommended):
+#    - Prone to overflow/underflow
+#    - Requires gradient scaling
+#    - Not supported in this recipe
+# ==============================================================================
+dtype: bf16
+
+
+# ==============================================================================
+# SECTION 10: Logging
+# ==============================================================================
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True
+log_level: INFO
+
+
+# ==============================================================================
+# SECTION 11: Profiler (Disabled by default)
+# ==============================================================================
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: True
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
+
+
+# ==============================================================================
+# FULL FINE-TUNING VS. LORA: COMPLETE COMPARISON
+# ==============================================================================
+"""
+**DECISION MATRIX**:
+
+┌─────────────────────┬──────────────────┬──────────────────┐
+│ Criteria            │ Full Fine-Tuning │ LoRA             │
+├─────────────────────┼──────────────────┼──────────────────┤
+│ Trainable Params    │ 100% (8B)        │ 0.08% (6M)       │
+│ Quality             │ 100% (best)      │ 95-98%           │
+│ GPU Memory (8B)     │ ~80 GB           │ ~16 GB           │
+│ GPUs Needed (8B)    │ 4× A100 24GB     │ 1× RTX 4090      │
+│ Training Speed      │ Slower           │ Faster           │
+│ Learning Rate       │ 2e-5             │ 3e-4 (15× higher)│
+│ Risk of Overfit     │ Higher           │ Lower            │
+│ Data Needed         │ More             │ Less             │
+│ Checkpoint Size     │ 16 GB            │ 10 MB (adapters) │
+│ Deployment          │ Full model       │ Base + adapters  │
+└─────────────────────┴──────────────────┴──────────────────┘
+
+**WHEN TO USE FULL FINE-TUNING**:
+
+✅ Use full fine-tuning when:
+- Quality is paramount (medical, legal, financial applications)
+- Have adequate compute (multiple GPUs)
+- Have large, high-quality dataset
+- Task requires significant adaptation
+- Can afford longer training time
+
+❌ Avoid full fine-tuning when:
+- Limited GPU resources (<40GB total)
+- Small dataset (risk of overfitting)
+- Quick iteration needed
+- LoRA quality sufficient (most cases!)
+
+**MEMORY BREAKDOWN** (Llama 3.1 8B):
+
+Component                  Memory (bf16)
+──────────────────────────────────────
+Model Weights              16 GB
+Gradients                  16 GB
+Optimizer States (Adam)    32 GB (fp32: 2 states × 2 bytes × 2)
+Activations                ~16 GB
+──────────────────────────────────────
+Total per GPU (4 GPUs)     ~20 GB
+Total across all GPUs      ~80 GB
+
+With optimizations:
+- Activation checkpointing: -40% activations → 14 GB per GPU
+- FSDP sharding: Weights distributed across GPUs
+- Result: Fits on 4× 24GB GPUs
+
+**TRAINING DYNAMICS**:
+
+Full fine-tuning:
+```
+Epoch 1, Step 100:  loss = 2.34  (started from 2.50)
+Epoch 1, Step 200:  loss = 1.98
+Epoch 1, Step 500:  loss = 1.52
+Epoch 1, Step 1000: loss = 1.24
+# Gradual improvement, small steps
+```
+
+LoRA:
+```
+Epoch 1, Step 100:  loss = 1.87  (started from 2.50)
+Epoch 1, Step 200:  loss = 1.34
+Epoch 1, Step 500:  loss = 0.95
+Epoch 1, Step 1000: loss = 0.78
+# Faster initial improvement, larger steps
+```
+
+**BEST PRACTICES**:
+
+1. **Start with LoRA**: Always try LoRA first!
+   - 90% of use cases: LoRA sufficient
+   - 10% of use cases: Full fine-tuning needed
+
+2. **Monitor validation loss**:
+   ```yaml
+   run_val_every_n_steps: 100
+   ```
+   Stop if val loss plateaus or increases
+
+3. **Use learning rate warmup**:
+   ```yaml
+   lr_scheduler:
+     num_warmup_steps: 100  # Gradual LR increase
+   ```
+   Prevents instability at start
+
+4. **Adjust LR based on dataset size**:
+   - Small dataset (<10K): lr = 1e-5
+   - Medium dataset (10K-100K): lr = 2e-5
+   - Large dataset (>100K): lr = 3e-5
+
+5. **Enable all memory optimizations**:
+   - Activation checkpointing: True
+   - Custom sharded layers: ['tok_embeddings', 'output']
+   - Compile: True (after confirming stability)
+
+**DEPLOYMENT COMPARISON**:
+
+LoRA Deployment:
+```
+deployment/
+├── base_model/              # 16 GB (shared)
+│   └── model.safetensors
+└── adapters/
+    ├── task1/adapter.pt     # 10 MB
+    ├── task2/adapter.pt     # 10 MB
+    └── task3/adapter.pt     # 10 MB
+# Can swap adapters instantly!
+```
+
+Full Fine-Tuning Deployment:
+```
+deployment/
+├── task1_model/            # 16 GB
+├── task2_model/            # 16 GB
+└── task3_model/            # 16 GB
+# Each task needs full model
+```
+
+**COST COMPARISON** (on cloud):
+
+LoRA (1× A100 40GB, 2 hours):
+- GPU cost: $2.50/hour × 2 = $5
+- Total: ~$5-10
+
+Full Fine-Tuning (4× A100 40GB, 4 hours):
+- GPU cost: $10/hour × 4 = $40
+- Total: ~$40-80
+
+**BOTTOM LINE**:
+Full fine-tuning is the gold standard for quality, but comes at
+significant cost in memory, time, and resources. LoRA achieves
+95-98% of the quality at 10% of the cost. Choose wisely!
+"""
