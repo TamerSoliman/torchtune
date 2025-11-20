@@ -1,0 +1,314 @@
+# ==============================================================================
+# ANNOTATED: DPO Recipe - Direct Preference Optimization (Alignment)
+# ==============================================================================
+# Source: recipes/configs/llama3_1/8B_lora_dpo_single_device.yaml
+#
+# **WHAT**: DPO (Direct Preference Optimization) aligns LLMs with human preferences
+#           by training on pairs of (chosen, rejected) responses
+#
+# **WHY**:  After supervised fine-tuning (SFT), models may generate:
+#           - Correct but verbose answers
+#           - Factually accurate but unhelpful responses
+#           - Safe but overly cautious outputs
+#           DPO teaches the model human preferences without RL complexity!
+#
+# **HOW**:  Uses preference pairs to directly optimize policy:
+#           - Given prompt + chosen response + rejected response
+#           - Increase probability of chosen response
+#           - Decrease probability of rejected response
+#           - No reward model needed (unlike RLHF/PPO)!
+#
+# **KEY DIFFERENCES FROM SFT**:
+#   1. Dataset: Preference pairs (not single completions)
+#   2. Loss: DPOLoss (not CrossEntropyLoss)
+#   3. Requirement: Model must be SFT'd first
+#   4. Learning rate: Higher than SFT (5e-4 vs. 3e-4)
+#
+# **RECIPE ENTRY POINT**: recipes/lora_dpo_single_device.py
+# ==============================================================================
+
+output_dir: /tmp/torchtune/llama3_1_8B/lora_dpo_single_device
+
+# ==============================================================================
+# Model: Same LoRA configuration as SFT
+# ==============================================================================
+# **IMPORTANT**: Start from SFT checkpoint, not base model!
+# ==============================================================================
+model:
+  _component_: torchtune.models.llama3_1.lora_llama3_1_8b
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: True
+  apply_lora_to_output: False
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+
+# ==============================================================================
+# Tokenizer: Shorter max_seq_len for DPO
+# ==============================================================================
+# **WHY SHORTER**: Each example has TWO completions (chosen + rejected)
+#                  Memory usage is ~2× that of SFT
+# ==============================================================================
+tokenizer:
+  _component_: torchtune.models.llama3.llama3_tokenizer
+  path: /tmp/Meta-Llama-3.1-8B-Instruct/original/tokenizer.model
+  max_seq_len: 1024  # ← Reduced from 2048+ for memory
+
+# ==============================================================================
+# Checkpointer: Load SFT checkpoint!
+# ==============================================================================
+# **CRITICAL**: Must load from SFT'd model, not base model
+#               DPO is a refinement step after SFT
+# ==============================================================================
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Meta-Llama-3.1-8B-Instruct/
+  checkpoint_files: [
+    model-00001-of-00004.safetensors,
+    model-00002-of-00004.safetensors,
+    model-00003-of-00004.safetensors,
+    model-00004-of-00004.safetensors
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: False
+save_adapter_weights_only: False
+
+# ==============================================================================
+# Dataset: PREFERENCE PAIRS (not single completions!)
+# ==============================================================================
+# **DATASET FORMAT**:
+# {
+#     "prompt": "What is the capital of France?",
+#     "chosen": "The capital of France is Paris.",
+#     "rejected": "France's capital city is Paris, which is located in..."
+# }
+#
+# **WHY STACK EXCHANGE**: High-quality preference data from voting
+#                         Upvoted answers = chosen
+#                         Downvoted answers = rejected
+# ==============================================================================
+dataset:
+  _component_: torchtune.datasets.stack_exchange_paired_dataset  # ← Preference dataset!
+
+seed: null
+shuffle: True
+batch_size: 4  # Can be slightly higher than SFT (shorter sequences)
+
+# ==============================================================================
+# Optimizer: Higher learning rate than SFT!
+# ==============================================================================
+# **WHY HIGHER LR**: DPO is a refinement step, can take larger steps
+#                    SFT: 3e-4
+#                    DPO: 5e-4 (1.67× higher)
+# ==============================================================================
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  weight_decay: 0.05  # Slightly higher than SFT (0.01)
+  lr: 5e-4  # ← Higher than SFT!
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 100
+
+# ==============================================================================
+# Loss: DPOLoss (THE KEY DIFFERENCE!)
+# ==============================================================================
+# **DPO LOSS EXPLAINED**:
+#
+# loss = -log(σ(β * (log π_θ(y_w|x) - log π_θ(y_l|x)
+#                     - log π_ref(y_w|x) + log π_ref(y_l|x))))
+#
+# Where:
+# - y_w: chosen (winner) response
+# - y_l: rejected (loser) response
+# - π_θ: policy model (being trained)
+# - π_ref: reference model (frozen, often same as initial model)
+# - β: temperature parameter
+# - σ: sigmoid function
+#
+# **INTUITION**:
+# Maximize: P(chosen) / P(rejected) under policy
+# While staying close to reference model
+#
+# **vs. RLHF**:
+# RLHF: Train reward model → Use PPO to optimize policy
+# DPO: Directly optimize policy from preferences (simpler!)
+# ==============================================================================
+loss:
+  _component_: torchtune.rlhf.loss.DPOLoss  # ← Specialized loss!
+
+# ==============================================================================
+# Training: Limited steps recommended
+# ==============================================================================
+# **WHY LIMIT STEPS**: DPO can overfit quickly on preference data
+#                      Usually 1 epoch or ~1000 steps sufficient
+# ==============================================================================
+epochs: 1
+max_steps_per_epoch: 1000  # ← Often limited!
+gradient_accumulation_steps: 8
+compile: False
+
+# ==============================================================================
+# Memory & Environment
+# ==============================================================================
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True
+log_level: INFO
+
+device: cuda
+dtype: bf16
+
+enable_activation_checkpointing: True
+enable_activation_offloading: False
+
+# ==============================================================================
+# DPO DEEP DIVE
+# ==============================================================================
+"""
+**THE DPO PIPELINE**:
+
+Step 1: Supervised Fine-Tuning (SFT)
+```
+Base Model → SFT on instructions → SFT Model
+(can follow instructions, but not aligned with preferences)
+```
+
+Step 2: Direct Preference Optimization
+```
+SFT Model → DPO on preferences → Aligned Model
+(follows instructions AND aligned with human preferences)
+```
+
+**PREFERENCE DATA EXAMPLE**:
+
+Prompt: "Explain quantum computing"
+
+Chosen (upvoted): ✓
+"Quantum computing uses quantum bits (qubits) that can exist in
+superposition, allowing parallel computation. This enables solving
+certain problems exponentially faster than classical computers."
+
+Rejected (downvoted): ✗
+"Quantum computing is a type of computing technology that utilizes
+the principles of quantum mechanics to process information using
+quantum bits or qubits instead of classical bits..."
+(accurate but verbose, less helpful)
+
+**DPO TRAINING STEP**:
+```python
+# Forward pass on both responses
+logits_chosen = model(chosen_tokens)
+logits_rejected = model(rejected_tokens)
+
+# Compute log probabilities
+logprob_chosen = compute_logprob(logits_chosen, chosen_labels)
+logprob_rejected = compute_logprob(logits_rejected, rejected_labels)
+
+# DPO loss (simplified)
+logits_diff = (logprob_chosen - logprob_rejected)
+loss = -F.logsigmoid(beta * logits_diff)
+
+# Backprop increases P(chosen), decreases P(rejected)
+loss.backward()
+```
+
+**HYPERPARAMETERS**:
+
+β (beta) temperature:
+- Higher β: Stronger preference signal
+- Lower β: Softer preference signal
+- Typical: 0.1 to 0.5
+- Default in torchtune: 0.1
+
+**RESULTS** (from DPO paper):
+
+Task                Without DPO    With DPO
+────────────────────────────────────────────
+Helpfulness         6.2/10         7.8/10
+Harmlessness        7.1/10         8.9/10
+Factuality          7.5/10         8.1/10
+
+**DPO vs. RLHF vs. SFT**:
+
+┌──────────────┬────────────┬────────────┬──────────┐
+│              │ SFT        │ DPO        │ RLHF/PPO │
+├──────────────┼────────────┼────────────┼──────────┤
+│ Data Type    │ Single     │ Pairs      │ Pairs    │
+│ Complexity   │ Simple     │ Medium     │ Complex  │
+│ Reward Model │ No         │ No         │ Yes      │
+│ Stability    │ High       │ High       │ Low      │
+│ Performance  │ Baseline   │ Good       │ Best     │
+│ Cost         │ Low        │ Medium     │ High     │
+└──────────────┴────────────┴────────────┴──────────┘
+
+**WHEN TO USE DPO**:
+
+✅ Use DPO when:
+- Have preference data (chosen/rejected pairs)
+- Want to align with human preferences
+- Need simpler alternative to RLHF
+- Want stable training (vs. PPO's instability)
+
+❌ Don't use DPO when:
+- No preference data available
+- SFT quality already sufficient
+- Need maximum alignment (use PPO)
+
+**CREATING PREFERENCE DATA**:
+
+Option 1: Human annotation
+- Show prompt to humans
+- Humans rank multiple responses
+- Use top as chosen, bottom as rejected
+
+Option 2: Automatic from existing data
+- Use upvotes/downvotes (Stack Exchange)
+- Use ratings (Reddit karma)
+- Use clicks/dwell time
+
+Option 3: Synthetic (AI-generated)
+- Generate multiple responses
+- Use reward model to rank
+- Use top/bottom as chosen/rejected
+
+**PRACTICAL TIPS**:
+
+1. Always SFT first:
+   ```bash
+   # Step 1: SFT
+   tune run lora_finetune_single_device --config llama3_1/8B_lora
+
+   # Step 2: DPO (on SFT checkpoint)
+   tune run lora_dpo_single_device --config llama3_1/8B_lora_dpo
+   ```
+
+2. Use shorter sequences:
+   - DPO processes 2× text per example
+   - max_seq_len: 512-1024 (vs. 2048+ for SFT)
+
+3. Limit training:
+   - 1 epoch often sufficient
+   - max_steps_per_epoch: 1000
+   - DPO can overfit quickly!
+
+4. Monitor both losses:
+   - chosen_loss: Should decrease
+   - rejected_loss: Should stay stable or increase
+   - If both decrease → model forgetting preferences
+
+**SUMMARY**:
+DPO is the sweet spot for alignment:
+- Simpler than RLHF
+- More effective than SFT alone
+- Stable training
+- No reward model needed
+Perfect for aligning models with human preferences!
+"""
