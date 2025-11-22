@@ -1,0 +1,402 @@
+# ==============================================================================
+# ANNOTATED: QLoRA Fine-Tuning Recipe - Quantized LoRA for Maximum Memory Efficiency
+# ==============================================================================
+# Source: recipes/configs/llama2/7B_qlora_single_device.yaml
+#
+# **WHAT**: QLoRA = Quantized LoRA combines two memory-saving techniques:
+#           1. 4-bit quantization of base model weights (NF4 format)
+#           2. LoRA adapters for parameter-efficient training
+#
+# **WHY**:  Enables fine-tuning large models on consumer hardware:
+#           - Full fine-tuning 7B: ~28GB GPU memory (impossible on most GPUs)
+#           - LoRA 7B (bf16): ~14GB (needs A100/4090)
+#           - QLoRA 7B: ~6GB (works on RTX 3090, 4070 Ti, etc.)
+#
+# **HOW**:  Memory savings breakdown:
+#           Base weights: 16-bit → 4-bit (75% reduction)
+#           LoRA adapters: Remain in 16-bit (high precision)
+#           Result: Train on 16GB GPU what normally needs 80GB!
+#
+# **KEY INNOVATION**: Despite 4-bit base weights, QLoRA maintains quality
+#                     nearly identical to full 16-bit LoRA!
+#
+# **RECIPE ENTRY POINT**: recipes/lora_finetune_single_device.py
+#                         Same recipe as regular LoRA, just different model
+# ==============================================================================
+
+
+# ==============================================================================
+# Global Configuration
+# ==============================================================================
+output_dir: /tmp/torchtune/llama2_7B/qlora_single_device
+
+
+# ==============================================================================
+# SECTION 1: Model Configuration - THE QLORA DIFFERENCE
+# ==============================================================================
+# **KEY DIFFERENCE FROM REGULAR LORA**: model._component_ points to qlora variant
+#
+# **WHAT HAPPENS**:
+# 1. Model builder creates standard Llama 2 7B architecture
+# 2. Base weights loaded in 16-bit
+# 3. Base weights quantized to 4-bit NF4 format
+# 4. LoRA adapters added (remain 16-bit)
+# 5. Only LoRA adapters trainable
+#
+# **MEMORY COMPARISON** (Llama 2 7B):
+# Full 16-bit:  7B params × 2 bytes = 14 GB
+# 4-bit NF4:    7B params × 0.5 bytes = 3.5 GB (4× smaller!)
+# LoRA adapters: ~6M params × 2 bytes = 12 MB (tiny!)
+# Total QLoRA model: ~3.5 GB (vs 14 GB for regular LoRA)
+# ==============================================================================
+model:
+  # --------------------------------------------------------------------------
+  # _component_: QLoRA model builder
+  # --------------------------------------------------------------------------
+  # **COMPARISON**:
+  # Regular LoRA: torchtune.models.llama2.lora_llama2_7b
+  # QLoRA:        torchtune.models.llama2.qlora_llama2_7b  ← Quantized!
+  #
+  # **IMPLEMENTATION** (see annotated_model_builders.py):
+  # qlora_llama2_7b = partial(lora_llama2_7b, quantize_base=True)
+  #
+  # So QLoRA is just LoRA with quantize_base=True!
+  # --------------------------------------------------------------------------
+  _component_: torchtune.models.llama2.qlora_llama2_7b
+
+  # --------------------------------------------------------------------------
+  # LoRA configuration (identical to regular LoRA)
+  # --------------------------------------------------------------------------
+  # **WHY SAME PARAMS**: QLoRA only changes base weight precision
+  #                      LoRA adapter configuration unchanged
+  # --------------------------------------------------------------------------
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: True
+  apply_lora_to_output: False
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+
+  # **NOTE**: quantize_base is handled by qlora_llama2_7b builder
+  # No need to specify it here!
+
+
+# ==============================================================================
+# SECTION 2: Tokenizer (Identical to LoRA)
+# ==============================================================================
+tokenizer:
+  _component_: torchtune.models.llama2.llama2_tokenizer
+  path: /tmp/Llama-2-7b-hf/tokenizer.model
+  max_seq_len: null
+
+
+# ==============================================================================
+# SECTION 3: Checkpointer (Identical to LoRA)
+# ==============================================================================
+# **IMPORTANT**: Checkpointer loads 16-bit weights, then model quantizes them
+#
+# **LOADING PROCESS**:
+# 1. Checkpointer loads pretrained weights in 16-bit
+# 2. Model's __init__ quantizes weights to 4-bit
+# 3. LoRA adapters initialized (16-bit)
+# 4. Training begins
+#
+# **SAVING PROCESS**:
+# 1. Save LoRA adapters (16-bit, ~10MB)
+# 2. Optionally save full model:
+#    - Dequantize base weights (4-bit → 16-bit)
+#    - Merge with adapters
+#    - Save in original format
+# ==============================================================================
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-2-7b-hf
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors
+  ]
+  adapter_checkpoint: null
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA2
+
+resume_from_checkpoint: False
+save_adapter_weights_only: False
+
+
+# ==============================================================================
+# SECTION 4: Dataset (Identical to LoRA)
+# ==============================================================================
+# **NO CHANGES**: Quantization doesn't affect data pipeline
+# ==============================================================================
+dataset:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  packed: False  # Set to True for better GPU utilization
+
+seed: null
+shuffle: True
+batch_size: 2
+
+
+# ==============================================================================
+# SECTION 5: Optimizer (Identical to LoRA)
+# ==============================================================================
+# **IMPORTANT**: Optimizer only tracks LoRA parameters
+#                Base (quantized) weights are frozen
+#
+# **MEMORY SAVINGS**:
+# Regular LoRA: Optimize ~100M params (all weights)
+# QLoRA: Optimize ~6M params (only adapters)
+# Optimizer states: ~50MB vs. ~700MB
+# ==============================================================================
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  weight_decay: 0.01
+  lr: 3e-4
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 100
+
+
+# ==============================================================================
+# SECTION 6: Loss (Identical to LoRA)
+# ==============================================================================
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+
+# ==============================================================================
+# SECTION 7: Training Configuration (Similar to LoRA)
+# ==============================================================================
+# **POTENTIAL ADJUSTMENTS FOR QLORA**:
+# - May need slightly more epochs (quantization can slow learning)
+# - Can use larger batch sizes (more memory available)
+# - Gradient accumulation can be lower (more memory per batch)
+# ==============================================================================
+epochs: 1
+max_steps_per_epoch: null
+gradient_accumulation_steps: 8
+
+# **TIP**: With QLoRA's memory savings, try:
+# gradient_accumulation_steps: 4
+# batch_size: 4
+# (Same effective batch size, but faster!)
+
+clip_grad_norm: null
+compile: False
+
+
+# ==============================================================================
+# SECTION 8: Logging (Identical to LoRA)
+# ==============================================================================
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True  # Will show memory savings!
+log_level: INFO
+
+
+# ==============================================================================
+# SECTION 9: Environment (Identical to LoRA)
+# ==============================================================================
+device: cuda
+dtype: bf16  # LoRA adapters use bf16, base uses 4-bit
+
+
+# ==============================================================================
+# SECTION 10: Memory Optimizations (Same as LoRA, but less critical)
+# ==============================================================================
+# **QLORA ALREADY SAVES MEMORY**, but these help further:
+# ==============================================================================
+enable_activation_checkpointing: True
+enable_activation_offloading: False  # Usually not needed with QLoRA
+
+
+# ==============================================================================
+# SECTION 11: Profiler (Identical to LoRA)
+# ==============================================================================
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: True
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 5
+  active_steps: 2
+  num_cycles: 1
+
+# Special flag for low CPU RAM environments (e.g., Colab)
+low_cpu_ram: False
+
+
+# ==============================================================================
+# QLoRA DEEP DIVE: How It Works
+# ==============================================================================
+"""
+**THE QUANTIZATION MAGIC**:
+
+Standard LoRA stores base weights in 16-bit:
+```python
+weight = torch.randn(4096, 4096, dtype=torch.bfloat16)
+# Memory: 4096 × 4096 × 2 bytes = 32 MB per weight matrix
+```
+
+QLoRA uses 4-bit NF4 (Normal Float 4):
+```python
+from torchao.dtypes.nf4tensor import to_nf4
+
+weight_bf16 = torch.randn(4096, 4096, dtype=torch.bfloat16)
+weight_nf4 = to_nf4(weight_bf16)  # Quantize!
+# Memory: 4096 × 4096 × 0.5 bytes = 8 MB per weight matrix (4× smaller!)
+```
+
+**NF4 FORMAT EXPLAINED**:
+- Normal Float 4-bit: 16 quantization levels
+- Designed for neural network weights (normally distributed)
+- Preserves important values, compresses less important ones
+
+Example weight distribution:
+```
+Original (bf16):  [..., -0.523, -0.012, 0.001, 0.437, ...]
+Quantized (NF4):  [..., -0.520, -0.010, 0.000, 0.440, ...]
+                       ↑         ↑        ↑       ↑
+                     Similar   Rounded  Rounded Similar
+```
+
+**FORWARD PASS WITH QUANTIZED WEIGHTS**:
+```python
+# In LoRALinear.forward():
+if self._quantize_base:
+    # Dequantize on-the-fly for computation
+    out = linear_nf4(input=x, weight=self.weight)  # Special 4-bit matmul
+else:
+    out = F.linear(x, self.weight)
+
+# Add LoRA adaptation (always 16-bit)
+lora_out = self.lora_b(self.lora_a(x))
+return out + (self.alpha / self.rank) * lora_out
+```
+
+**MEMORY BREAKDOWN** (Llama 2 7B):
+
+Full Fine-Tuning (bf16):
+- Weights: 7B × 2 = 14 GB
+- Gradients: 7B × 2 = 14 GB
+- Optimizer (Adam): 7B × 8 = 56 GB (2 states per param)
+- Activations: ~4 GB
+- Total: ~88 GB (needs A100 80GB!)
+
+Regular LoRA (bf16):
+- Weights: 7B × 2 = 14 GB
+- LoRA adapters: 6M × 2 = 12 MB
+- Gradients (adapters only): 6M × 2 = 12 MB
+- Optimizer (adapters only): 6M × 8 = 48 MB
+- Activations: ~4 GB
+- Total: ~18 GB (needs A100 40GB or 4090)
+
+QLoRA (4-bit + bf16):
+- Weights (4-bit): 7B × 0.5 = 3.5 GB ← 4× smaller!
+- LoRA adapters (bf16): 6M × 2 = 12 MB
+- Gradients (adapters only): 6M × 2 = 12 MB
+- Optimizer (adapters only): 6M × 8 = 48 MB
+- Activations: ~4 GB
+- Total: ~8 GB (works on 3090, 4070 Ti!)
+
+**QUALITY COMPARISON** (from QLoRA paper):
+```
+Task                  Full FT    LoRA    QLoRA
+MMLU (accuracy)       43.4%      43.1%   43.0%  ← Barely any loss!
+TruthfulQA            51.0%      50.7%   50.5%
+```
+
+Despite 4× compression, quality drop is minimal!
+
+**WHEN TO USE QLORA**:
+
+✅ Use QLoRA when:
+- GPU memory limited (<24GB)
+- Want to fine-tune 7B+ models on consumer GPUs
+- Quality very close to full LoRA acceptable
+
+❌ Use regular LoRA when:
+- Have plenty of GPU memory (>40GB)
+- Need absolute best quality
+- Want faster training (no quantization overhead)
+
+✅ Use full fine-tuning when:
+- Have 80GB+ GPU
+- Need maximum quality
+- Training small model (<1B params)
+
+**PRACTICAL TIPS**:
+
+1. **Start with QLoRA**: Try it first! Often quality difference unnoticeable.
+
+2. **Monitor training**: If loss doesn't decrease as expected, try:
+   - Increase learning rate slightly (3e-4 → 5e-4)
+   - Add more epochs
+   - Increase LoRA rank (8 → 16)
+
+3. **Leverage memory savings**: With QLoRA's savings, you can:
+   - Increase batch size
+   - Reduce gradient accumulation
+   - Result: Faster training!
+
+4. **Deployment**: Can deploy in 4-bit or dequantize for production
+   ```python
+   # Option 1: Deploy in 4-bit (smallest)
+   # Use adapter_model.pt + quantized base
+
+   # Option 2: Dequantize and merge (best quality)
+   # Merge adapters, save in 16-bit
+   ```
+
+**SUMMARY**:
+QLoRA = 4-bit base weights + 16-bit LoRA adapters
+Result: 4× memory savings, <1% quality loss
+Perfect for democratizing LLM fine-tuning!
+"""
+
+
+# ==============================================================================
+# COMPARISON TO REGULAR LORA CONFIG
+# ==============================================================================
+"""
+**ONLY ONE LINE DIFFERENT**:
+
+Regular LoRA:
+```yaml
+model:
+  _component_: torchtune.models.llama2.lora_llama2_7b
+```
+
+QLoRA:
+```yaml
+model:
+  _component_: torchtune.models.llama2.qlora_llama2_7b  ← Just this!
+```
+
+Everything else is IDENTICAL. This is the power of modular design!
+
+**UNDER THE HOOD**:
+```python
+# In _model_builders.py:
+lora_llama2_7b = lambda **kwargs: build_lora_model(quantize_base=False, **kwargs)
+qlora_llama2_7b = lambda **kwargs: build_lora_model(quantize_base=True, **kwargs)
+
+# Or using partial:
+qlora_llama2_7b = partial(lora_llama2_7b, quantize_base=True)
+```
+
+That's it! QLoRA is just LoRA with one boolean flag.
+Modular architecture at its finest!
+"""

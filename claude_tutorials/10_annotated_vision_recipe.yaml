@@ -1,0 +1,598 @@
+# ==============================================================================
+# ANNOTATED: Llama 3.2 Vision 11B LoRA Recipe - Multimodal Fine-Tuning
+# ==============================================================================
+# Source: recipes/configs/llama3_2_vision/11B_lora_single_device.yaml
+#
+# **WHAT**: LoRA fine-tuning for vision-language model (images + text)
+#
+# **WHY THIS EXAMPLE MATTERS**: Demonstrates multimodal extension!
+#           - Text-only models: Single modality (tokens)
+#           - Vision models: Two modalities (images + text)
+#           - Same LoRA technique, different architecture components
+#           - Shows torchtune's flexibility beyond pure language models
+#
+# **VISION MODEL ARCHITECTURE**:
+#   ┌─────────────────────────────────────────────────────┐
+#   │  Input: Image (560×560) + Text Prompt               │
+#   └─────────────────────────────────────────────────────┘
+#                        ↓
+#   ┌─────────────────────────────────────────────────────┐
+#   │  Vision Encoder (Image → Visual Tokens)             │
+#   │  - ViT-style transformer (patch embeddings)         │
+#   │  - Output: Grid of visual features                  │
+#   │  - Status: LoRA adapters (encoder_trainable="lora") │
+#   └─────────────────────────────────────────────────────┘
+#                        ↓
+#   ┌─────────────────────────────────────────────────────┐
+#   │  Cross-Modal Fusion (Visual ↔ Language)             │
+#   │  - Cross-attention layers                           │
+#   │  - Aligns visual and text representations           │
+#   │  - Status: LoRA adapters (fusion_trainable="lora")  │
+#   └─────────────────────────────────────────────────────┘
+#                        ↓
+#   ┌─────────────────────────────────────────────────────┐
+#   │  Language Decoder (Generate Text Response)          │
+#   │  - Llama 3.2 11B transformer                        │
+#   │  - Attends to both text and visual tokens           │
+#   │  - Status: Frozen (decoder_trainable="frozen")      │
+#   └─────────────────────────────────────────────────────┘
+#                        ↓
+#   ┌─────────────────────────────────────────────────────┐
+#   │  Output: Text Response                              │
+#   └─────────────────────────────────────────────────────┘
+#
+# **KEY DIFFERENCES FROM TEXT-ONLY MODELS**:
+#   1. Components: Encoder + Fusion + Decoder (vs just Decoder)
+#   2. Training: Selective freezing (decoder frozen, others LoRA)
+#   3. Input: Images + Text (vs Text only)
+#   4. Transform: Vision transform (vs Tokenizer)
+#   5. Dataset: Multimodal (vs Text-only)
+#   6. Collation: Image-aware batching
+#   7. Learning rate: Lower (1e-4 vs 3e-4)
+#   8. Gradient clipping: Required (1.0 vs null)
+#
+# **RECIPE ENTRY POINT**: recipes/lora_finetune_single_device.py (same!)
+# ==============================================================================
+
+output_dir: /tmp/torchtune/llama3_2_vision_11B/lora_single_device
+
+# ==============================================================================
+# Model: Multimodal Architecture with Selective LoRA
+# ==============================================================================
+# **CRITICAL CONCEPT**: Not all components trained equally!
+#
+# **THREE TRAINABILITY MODES**:
+#   1. "frozen": Weights completely frozen (not trained)
+#   2. "lora": LoRA adapters added and trained (base weights frozen)
+#   3. "full": All weights trainable (not used here, too expensive)
+#
+# **STRATEGY FOR THIS CONFIG**:
+#   - decoder_trainable: "frozen" ← 11B language model (already good at text)
+#   - encoder_trainable: "lora" ← Vision encoder (adapt to new image types)
+#   - fusion_trainable: "lora" ← Cross-modal fusion (adapt alignment)
+#
+# **WHY FREEZE DECODER?**:
+#   - Llama 3.2 11B decoder already trained on trillions of text tokens
+#   - Freezing prevents catastrophic forgetting
+#   - Only need to adapt vision understanding, not language generation
+#   - Saves memory: No gradients for 11B params!
+#
+# **WHY LORA ON ENCODER/FUSION?**:
+#   - Vision encoder: Adapt to new image domains (medical, satellite, etc.)
+#   - Fusion: Learn better image-text alignment for new tasks
+#   - Small LoRA adapters: ~50M trainable params vs 11B frozen
+#
+# **IMAGE SIZE**: 560×560 pixels
+#   - Must match between model and transform!
+#   - Higher resolution = better detail, more memory
+#   - Llama 3.2 Vision uses 560 (vs 336 for LLaVA, 224 for CLIP)
+# ==============================================================================
+model:
+  _component_: torchtune.models.llama3_2_vision.lora_llama3_2_vision_11b
+
+  # Component-wise training strategy
+  decoder_trainable: "frozen"  # ← 11B language model frozen!
+  encoder_trainable: "lora"    # ← Vision encoder with LoRA adapters
+  fusion_trainable: "lora"     # ← Cross-attention with LoRA adapters
+
+  # LoRA configuration (applied to encoder and fusion)
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: True
+  apply_lora_to_output: False
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+
+  # Image configuration
+  image_size: 560  # ← Must match tokenizer.image_size!
+
+# ==============================================================================
+# Transform: Vision Transform (Not a Text Tokenizer!)
+# ==============================================================================
+# **CRITICAL DIFFERENCE**: Not "tokenizer" but "transform"!
+#
+# **WHAT IT DOES**:
+#   1. Text Processing: Standard Llama 3 tokenizer
+#      "What's in this image?" → [1234, 5678, 910, ...]
+#
+#   2. Image Processing: Vision transform
+#      - Resize to 560×560
+#      - Normalize RGB values
+#      - Tile for high-resolution (multiple crops)
+#      - Convert to patches (like ViT)
+#      Input: PIL Image or file path
+#      Output: Tensor (3, 560, 560) or multiple tiles
+#
+#   3. Combined Output: Interleaved image and text tokens
+#      [<image_start>, patch_1, patch_2, ..., patch_N, <image_end>,
+#       text_token_1, text_token_2, ...]
+#
+# **TILING EXPLAINED**:
+#   High-resolution images → Split into tiles → Process independently
+#   ```
+#   1120×1120 image → 4 tiles of 560×560
+#   ┌─────┬─────┐
+#   │ T1  │ T2  │
+#   ├─────┼─────┤
+#   │ T3  │ T4  │
+#   └─────┴─────┘
+#   Each tile processed by vision encoder
+#   ```
+#
+# **IMPLEMENTATION**: torchtune/models/llama3_2_vision/_transform.py
+# ==============================================================================
+tokenizer:
+  _component_: torchtune.models.llama3_2_vision.llama3_2_vision_transform
+  path: /tmp/Llama-3.2-11B-Vision-Instruct/original/tokenizer.model
+  image_size: 560  # ← Must match model.image_size!
+  max_seq_len: 8192  # Longer than text-only (includes image tokens)
+
+# ==============================================================================
+# Checkpointer: Vision Model Format
+# ==============================================================================
+# **FILENAME FORMAT**: Parameterized pattern
+#   - filename_format: "model-{}-of-{}.safetensors"
+#   - max_filename: "00005"
+#   - Results in: model-00001-of-00005.safetensors, ..., model-00005-of-00005.safetensors
+#
+# **WHY 5 FILES?**: 11B model + vision encoder
+#   - Larger than text-only 8B (4 files)
+#   - Smaller than 70B (multiple files)
+#
+# **MODEL TYPE**: LLAMA3_VISION (different weight mapping than LLAMA3)
+# ==============================================================================
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/Llama-3.2-11B-Vision-Instruct/
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors  # ← Template pattern
+    max_filename: "00005"  # ← 5 files total
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3_VISION  # ← Vision-specific weight mapping
+
+resume_from_checkpoint: False
+save_adapter_weights_only: False  # Vision PeFT format not available yet
+
+# ==============================================================================
+# Dataset: Multimodal Dataset (Images + Text)
+# ==============================================================================
+# **THE CAULDRON**: Massive multimodal dataset collection
+#   - Aggregates 50+ vision-language datasets
+#   - Tasks: VQA, OCR, captioning, reasoning, etc.
+#   - Format: Unified schema for all subsets
+#
+# **OCRVQA SUBSET**: Optical Character Recognition + Visual Question Answering
+#   - Images: Book covers, documents, signs with text
+#   - Task: Answer questions about text in images
+#   - Example:
+#     ```
+#     Image: [Photo of a book cover showing "The Great Gatsby"]
+#     Question: "What is the title of this book?"
+#     Answer: "The Great Gatsby"
+#     ```
+#
+# **DATASET FORMAT**:
+#   ```python
+#   {
+#       "images": [PIL.Image],  # ← Can be multiple images!
+#       "conversations": [
+#           {"role": "user", "content": "<image> What's in this image?"},
+#           {"role": "assistant", "content": "A cat sitting on a mat."}
+#       ]
+#   }
+#   ```
+#
+# **PACKED**: False (multimodal packing complex, usually disabled)
+#
+# **IMPLEMENTATION**: torchtune/datasets/multimodal/_the_cauldron.py
+# ==============================================================================
+dataset:
+  _component_: torchtune.datasets.multimodal.the_cauldron_dataset
+  packed: False  # Image packing complex, usually disabled
+  subset: ocrvqa  # ← Specific task (can change to "ai2d", "chart2text", etc.)
+
+seed: null
+shuffle: True
+
+# **SPECIAL COLLATE FUNCTION**: Image-aware batching
+#   - Standard collate: Pads text sequences to same length
+#   - Image collate: Handles variable image counts, tiling, masking
+#   - Implementation: torchtune/data/_collate.py
+collate_fn: torchtune.data.padded_collate_tiled_images_and_mask
+
+# ==============================================================================
+# Training Configuration
+# ==============================================================================
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 2  # Lower than text-only (images use more memory)
+gradient_accumulation_steps: 8  # Effective batch: 2 × 8 = 16
+
+# ==============================================================================
+# Optimizer: Lower Learning Rate than Text-Only
+# ==============================================================================
+# **LEARNING RATE**: 1e-4 (lower than text-only 3e-4)
+#   - Why lower? Vision models more sensitive to LR
+#   - Higher LR → Unstable training, blurry image understanding
+#   - Conservative LR → Stable, better convergence
+# ==============================================================================
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  weight_decay: 0.01
+  lr: 1e-4  # ← Lower than text-only (1e-4 vs 3e-4)
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 100
+
+# ==============================================================================
+# Loss: Same as Text-Only (Still Language Modeling!)
+# ==============================================================================
+# **KEY INSIGHT**: Vision model, but still next-token prediction!
+#   - Model sees: <image_tokens> + "What's in this image?" + "A cat"
+#   - Loss: Predict "A" given "<image_tokens> What's in this image?"
+#   - Loss: Predict "cat" given "<image_tokens> What's in this image? A"
+#   - Image tokens provide visual context, but loss is still text generation
+# ==============================================================================
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# **GRADIENT CLIPPING**: Required for multimodal stability!
+#   - Why? Vision encoder gradients can be large (high-res images)
+#   - clip_grad_norm=1.0 caps gradient L2 norm
+#   - Prevents exploding gradients, stabilizes training
+clip_grad_norm: 1.0  # ← Important for vision models!
+
+compile: False
+
+# ==============================================================================
+# Device & Memory
+# ==============================================================================
+device: cuda
+
+# **ACTIVATION CHECKPOINTING**: Enabled (vision uses more memory)
+#   - 11B model + vision encoder + image activations → high memory
+#   - Checkpointing reduces peak memory by ~40%
+#   - Trade-off: 10-15% slower training
+enable_activation_checkpointing: True  # ← Required for single GPU
+
+dtype: bf16
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True
+log_level: INFO
+
+# ==============================================================================
+# Profiler
+# ==============================================================================
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: True
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
+
+# ==============================================================================
+# MULTIMODAL ARCHITECTURE DEEP DIVE
+# ==============================================================================
+"""
+**VISION ENCODER DETAILS**:
+
+Architecture: ViT (Vision Transformer) variant
+- Patch size: 14×14 pixels
+- Image 560×560 → 40×40 patches = 1,600 patches
+- Each patch embedded to dimension (e.g., 1024)
+- Transformer layers process patch embeddings
+- Output: Visual tokens (1,600 tokens per image)
+
+Pseudocode:
+```python
+# Vision encoder
+def encode_image(image):  # image: (3, 560, 560)
+    # Split into patches
+    patches = image.unfold(2, 14, 14).unfold(3, 14, 14)
+    patches = patches.reshape(3, -1, 14, 14)  # (3, 1600, 14, 14)
+
+    # Project to embedding dim
+    embeddings = patch_projection(patches)  # (1600, 1024)
+
+    # Add positional embeddings
+    embeddings += positional_embeddings
+
+    # Transformer layers with LoRA adapters
+    for layer in vision_transformer_layers:
+        embeddings = layer(embeddings)  # LoRA adapters here!
+
+    return embeddings  # (1600, 1024) visual tokens
+```
+
+**CROSS-MODAL FUSION DETAILS**:
+
+Architecture: Cross-attention layers
+- Query: Text tokens
+- Key/Value: Visual tokens
+- Allows text to "look at" relevant image regions
+
+Pseudocode:
+```python
+# Fusion layer
+def fuse_modalities(text_tokens, visual_tokens):
+    # Self-attention on text
+    text_tokens = text_self_attention(text_tokens)
+
+    # Cross-attention: text attends to visual
+    Q = linear_q(text_tokens)  # LoRA adapter here!
+    K = linear_k(visual_tokens)  # LoRA adapter here!
+    V = linear_v(visual_tokens)  # LoRA adapter here!
+
+    attention_weights = softmax(Q @ K.T / sqrt(d))
+    fused = attention_weights @ V
+
+    return fused + text_tokens  # Residual connection
+```
+
+**EXAMPLE FORWARD PASS**:
+
+Input:
+```python
+image = load_image("cat.jpg")  # (3, 560, 560)
+text = "What animal is in this image?"
+```
+
+Step 1: Encode Image
+```python
+visual_tokens = vision_encoder(image)  # (1600, 1024) with LoRA
+```
+
+Step 2: Tokenize Text
+```python
+text_tokens = tokenizer.encode(text)  # [1234, 5678, 910, ...]
+text_embeddings = embedding_layer(text_tokens)  # (7, 4096)
+```
+
+Step 3: Fusion (Cross-Modal Attention)
+```python
+fused_tokens = fusion_layer(text_embeddings, visual_tokens)  # LoRA adapters
+# Text tokens now enriched with visual information
+```
+
+Step 4: Decoder (Frozen!)
+```python
+logits = decoder(fused_tokens)  # (7, vocab_size)
+# No LoRA, frozen weights
+```
+
+Step 5: Generate Response
+```python
+next_token_id = argmax(logits[-1])  # Predict next token
+# Continue generation: "A", "cat", ".", ...
+```
+
+**MEMORY BREAKDOWN** (11B Vision Model, Single GPU):
+
+```
+Component                       Memory (GB)    Trainable?
+──────────────────────────────────────────────────────────
+Vision Encoder (frozen weights)    2.5 GB      No
+Vision Encoder (LoRA adapters)     0.05 GB     Yes
+Fusion Layers (frozen weights)     0.5 GB      No
+Fusion Layers (LoRA adapters)      0.02 GB     Yes
+Decoder (frozen weights)          22.0 GB      No (frozen!)
+Optimizer States (for adapters)    0.14 GB     -
+Activations (with checkpointing)   4.0 GB      -
+Image Buffers                      2.0 GB      -
+──────────────────────────────────────────────────────────
+Total                             ~31 GB       0.07 GB trainable
+
+With activation checkpointing: Fits on 40GB A100!
+Without: Would need ~45GB (OOM on single A100)
+```
+
+**WHY FREEZE DECODER?**:
+
+Comparison:
+
+Full Fine-Tuning (All 11B parameters):
+- Trainable params: 11B
+- Memory: ~60 GB (doesn't fit on single GPU!)
+- Risk: Catastrophic forgetting of language ability
+- Training time: 10× longer
+
+LoRA on Encoder+Fusion Only (This config):
+- Trainable params: 70M (0.6% of total)
+- Memory: ~31 GB (fits on A100!)
+- Risk: Minimal (language model unchanged)
+- Training time: Fast
+
+**DATASET EXAMPLES** (The Cauldron - OCRVQA):
+
+Example 1 - Simple OCR:
+```
+Image: Street sign saying "STOP"
+Q: "What does the sign say?"
+A: "STOP"
+```
+
+Example 2 - Complex OCR:
+```
+Image: Restaurant menu
+Q: "How much does the burger cost?"
+A: "$12.99"
+```
+
+Example 3 - Reasoning:
+```
+Image: Book cover "1984" by George Orwell
+Q: "Who wrote this book?"
+A: "George Orwell"
+```
+
+**OTHER CAULDRON SUBSETS**:
+
+- ai2d: Diagram understanding
+- chart2text: Chart/graph to text
+- docvqa: Document question answering
+- infographicsvqa: Infographic understanding
+- scienceqa: Science diagrams
+- textcaps: Caption images with text
+- visualmrc: Visual machine reading
+
+**TILED IMAGE COLLATION**:
+
+Why special collate function?
+
+Problem: Images can be different sizes, require tiling
+
+```python
+# Batch of 2 examples
+batch = [
+    {
+        "images": [small_image],  # 560×560, 1 tile
+        "tokens": [1, 2, 3, 4, 5]
+    },
+    {
+        "images": [large_image],  # 1120×1120, 4 tiles
+        "tokens": [1, 2, 3]
+    }
+]
+
+# Standard collate would fail (different tile counts)
+# Custom collate:
+collated = padded_collate_tiled_images_and_mask(batch)
+# Result:
+# - images: Padded to max tiles (4)
+# - image_masks: [1, 1, 1, 1] for ex2, [1, 0, 0, 0] for ex1
+# - tokens: Padded to max length (5)
+# - token_masks: [1, 1, 1, 1, 1] for ex1, [1, 1, 1, 0, 0] for ex2
+```
+
+**VISION MODEL COMPARISON**:
+
+┌────────────────┬──────────┬──────────┬───────────┬──────────────┐
+│ Model          │ Params   │ Img Res  │ LoRA On   │ Frozen       │
+├────────────────┼──────────┼──────────┼───────────┼──────────────┤
+│ LLaVA 7B       │ 7B       │ 336      │ Full      │ None         │
+│ LLaVA 13B      │ 13B      │ 336      │ Full      │ None         │
+│ Llama 3.2 11B  │ 11B      │ 560      │ Enc+Fuse  │ Decoder      │
+│ Llama 3.2 90B  │ 90B      │ 560      │ Enc+Fuse  │ Decoder      │
+│ Qwen-VL 7B     │ 7B       │ 448      │ Full      │ None         │
+└────────────────┴──────────┴──────────┴───────────┴──────────────┘
+
+**GRADIENT CLIPPING IMPORTANCE**:
+
+Without clipping (clip_grad_norm=null):
+```
+Step 10: grad_norm=0.5 ✓
+Step 11: grad_norm=1.2 ✓
+Step 12: grad_norm=47.3 ✗ (exploding gradient!)
+Step 13: loss=NaN (training collapsed)
+```
+
+With clipping (clip_grad_norm=1.0):
+```
+Step 10: grad_norm=0.5 → no clipping
+Step 11: grad_norm=1.2 → clipped to 1.0
+Step 12: grad_norm=47.3 → clipped to 1.0
+Step 13: loss=0.45 (stable training)
+```
+
+Clipping formula:
+```python
+total_norm = sqrt(sum(param.grad.norm() ** 2 for param in model.parameters()))
+if total_norm > clip_grad_norm:
+    scale = clip_grad_norm / total_norm
+    for param in model.parameters():
+        param.grad *= scale
+```
+
+**USE CASES FOR VISION FINE-TUNING**:
+
+✅ Good Use Cases:
+- Medical imaging: X-rays, MRIs with diagnostic questions
+- Satellite imagery: Land use classification, change detection
+- Document understanding: Invoices, forms, receipts
+- OCR in the wild: Street signs, menus, product labels
+- Scientific diagrams: Charts, graphs, schematics
+- Retail: Product recognition, shelf analysis
+
+❌ Not Ideal:
+- Pure image classification (use vision-only model)
+- Simple OCR (use specialized OCR model)
+- Real-time video (too slow)
+
+**PRACTICAL TIPS**:
+
+1. Start with frozen decoder:
+   - Fastest training
+   - Minimal forgetting risk
+   - Good for domain adaptation
+
+2. If not enough:
+   - Try LoRA on decoder too (slower, more memory)
+   - Increase LoRA rank (8 → 16 → 32)
+
+3. Image resolution:
+   - 560: Standard, good speed/quality trade-off
+   - 1120: 4× slower, better detail (documents, diagrams)
+   - 280: 4× faster, worse quality (prototyping)
+
+4. Batch size:
+   - Images use 10× more memory than text
+   - batch_size=2 with gradient_accumulation=8 works well
+   - If OOM: batch_size=1, gradient_accumulation=16
+
+5. Learning rate:
+   - Start with 1e-4
+   - Too high (3e-4): Blurry image understanding
+   - Too low (1e-5): Very slow convergence
+
+**SUMMARY**:
+This vision recipe demonstrates torchtune's multimodal capabilities:
+- ✅ Vision + Language architecture (encoder + fusion + decoder)
+- ✅ Selective training (LoRA on vision, freeze language)
+- ✅ Image-aware data pipeline (transforms, tiling, collation)
+- ✅ Stability techniques (gradient clipping, lower LR)
+- ✅ Memory efficiency (activation checkpointing)
+- ✅ Same recipe framework as text-only models!
+
+The pinnacle of torchtune's modular design: extending to new modalities
+with minimal code changes, maximum flexibility!
+"""
+

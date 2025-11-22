@@ -1,0 +1,709 @@
+# ==============================================================================
+# ANNOTATED: LoRA Fine-Tuning Recipe Configuration
+# ==============================================================================
+# Source: recipes/configs/llama3_1/8B_lora_single_device.yaml
+#
+# **WHAT**: A complete configuration file that specifies ALL components needed
+#           for LoRA fine-tuning: model, optimizer, dataset, training params, etc.
+#
+# **WHY**:  This YAML file is the "source of truth" for an experiment. By
+#           changing this file (not code!), you can:
+#           - Switch models (8B → 70B)
+#           - Try different hyperparameters (rank, learning rate)
+#           - Use different datasets
+#           - Enable/disable memory optimizations
+#           All without touching a single line of Python!
+#
+# **HOW**:  The config system (see annotated_config_instantiation.py) reads
+#           this YAML and creates Python objects. Key mechanism:
+#           - `_component_`: Dotted path to class/function
+#           - Other fields: Arguments to that class/function
+#           - `${var}`: References to other config values (interpolation)
+#
+# **RECIPE ENTRY POINT**: recipes/lora_finetune_single_device.py
+#                         This Python file contains the training loop logic.
+#                         It receives this config and instantiates components.
+# ==============================================================================
+
+
+# ==============================================================================
+# Global Output Directory
+# ==============================================================================
+# **WHAT**: Where all outputs (checkpoints, logs) will be saved
+# **WHY**: Centralized location makes it easy to find results
+# **HOW USED**: Referenced throughout config via ${output_dir}
+#
+# **IMPORTANT**: /tmp is often cleared on reboot! Use persistent storage for
+#                real experiments (e.g., /home/user/experiments/)
+# ==============================================================================
+output_dir: /tmp/torchtune/llama3_1_8B/lora_single_device
+
+
+# ==============================================================================
+# SECTION 1: Model Configuration
+# ==============================================================================
+# **WHAT**: Specifies which model to use and how to configure it
+# **HOW IT WORKS**:
+#   1. Config parser reads this section
+#   2. instantiate(cfg.model) is called in the recipe
+#   3. System imports torchtune.models.llama3_1.lora_llama3_1_8b
+#   4. Calls lora_llama3_1_8b(lora_attn_modules=[...], lora_rank=8, ...)
+#   5. Returns TransformerDecoder ready for training
+# ==============================================================================
+model:
+  # --------------------------------------------------------------------------
+  # _component_: THE MAGIC KEY
+  # --------------------------------------------------------------------------
+  # **WHAT**: Dotted path to the Python function/class to instantiate
+  # **HOW TO READ**: torchtune.models.llama3_1.lora_llama3_1_8b means:
+  #   - Module: torchtune.models.llama3_1
+  #   - Function: lora_llama3_1_8b
+  #
+  # **WHAT IT DOES**: See annotated_model_builders.py for implementation
+  #   This function:
+  #   1. Sets architecture defaults (num_layers=32, embed_dim=4096, etc.)
+  #   2. Applies LoRA to specified modules
+  #   3. Returns complete model
+  #
+  # **TO EXPERIMENT**:
+  #   - Want 70B model? Change to: lora_llama3_1_70b
+  #   - Want QLoRA? Change to: qlora_llama3_1_8b
+  #   - Want full fine-tuning? Change to: llama3_1_8b
+  # --------------------------------------------------------------------------
+  _component_: torchtune.models.llama3_1.lora_llama3_1_8b
+
+  # --------------------------------------------------------------------------
+  # lora_attn_modules: Which attention layers get LoRA adapters
+  # --------------------------------------------------------------------------
+  # **WHAT**: List of attention projection names to wrap with LoRA
+  # **OPTIONS**: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  # **DEFAULTS**: ['q_proj', 'v_proj', 'output_proj'] is most common
+  #
+  # **WHY NOT k_proj?**: Empirically, adapting query and value projections
+  #                      is often sufficient. Including k_proj adds parameters
+  #                      with marginal quality improvement.
+  #
+  # **MEMORY IMPACT**:
+  #   - 3 modules (q, v, output): ~6.3M trainable params
+  #   - 4 modules (q, k, v, output): ~8.4M trainable params
+  #   - 2 modules (q, v): ~4.2M trainable params
+  # --------------------------------------------------------------------------
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+
+  # --------------------------------------------------------------------------
+  # apply_lora_to_mlp: Whether to adapt feed-forward (MLP) layers
+  # --------------------------------------------------------------------------
+  # **WHAT**: If True, applies LoRA to the two linear layers in each FFN
+  # **TRADEOFF**:
+  #   True:  More capacity, better quality, slower, more memory
+  #   False: Faster, less memory, often sufficient
+  #
+  # **TYPICAL**: True for tasks requiring significant adaptation (e.g., new
+  #              domain, instruction following). False for small adaptations.
+  #
+  # **PARAMETER COUNT**: Adds ~10M params (for 8B model) when True
+  # --------------------------------------------------------------------------
+  apply_lora_to_mlp: True
+
+  # --------------------------------------------------------------------------
+  # apply_lora_to_output: Whether to adapt final output projection
+  # --------------------------------------------------------------------------
+  # **WHAT**: If True, applies LoRA to the final linear layer (hidden → vocab)
+  # **TYPICAL**: False (output projection is small relative to attention/FFN)
+  # **WHEN TRUE**: When adapting to new tokens or specialized vocabularies
+  # --------------------------------------------------------------------------
+  apply_lora_to_output: False
+
+  # --------------------------------------------------------------------------
+  # lora_rank: THE CRITICAL HYPERPARAMETER
+  # --------------------------------------------------------------------------
+  # **WHAT**: Rank of the low-rank decomposition matrices A and B
+  # **CONTROLS**: Trainable parameters and model expressiveness
+  #
+  # **PARAMETER MATH** (per adapted layer):
+  #   Parameters = (input_dim + output_dim) × rank
+  #   For Llama 8B attention (4096 → 4096):
+  #     rank=4:  (4096 + 4096) × 4  = 32,768 params
+  #     rank=8:  (4096 + 4096) × 8  = 65,536 params
+  #     rank=16: (4096 + 4096) × 16 = 131,072 params
+  #
+  # **QUALITY VS. COST**:
+  #   rank=4:  Very few params, fast, limited capacity
+  #   rank=8:  Sweet spot for most tasks
+  #   rank=16: Better quality, 2× params, diminishing returns
+  #   rank=32+: Rarely needed, expensive
+  #
+  # **RULE OF THUMB**: Start with 8, increase if underfitting
+  # --------------------------------------------------------------------------
+  lora_rank: 8
+
+  # --------------------------------------------------------------------------
+  # lora_alpha: Scaling factor for LoRA updates
+  # --------------------------------------------------------------------------
+  # **WHAT**: Controls the magnitude of LoRA adaptations
+  # **FORMULA**: LoRA output is scaled by (alpha / rank)
+  #
+  # **TYPICAL**: alpha = 2 × rank
+  #   - rank=8, alpha=16 → scaling = 16/8 = 2.0
+  #   - rank=16, alpha=32 → scaling = 32/16 = 2.0
+  #
+  # **WHY THIS RATIO**: Empirically works well, keeps scaling consistent
+  #                     across different ranks
+  #
+  # **TUNING**: Can adjust alpha without retraining (scales existing weights)
+  #             Higher alpha = stronger adaptation
+  # --------------------------------------------------------------------------
+  lora_alpha: 16
+
+  # --------------------------------------------------------------------------
+  # lora_dropout: Dropout probability applied before LoRA adapters
+  # --------------------------------------------------------------------------
+  # **WHAT**: Standard dropout for regularization
+  # **TYPICAL**: 0.0 (no dropout) or 0.05 (light regularization)
+  # **WHEN TO USE**: If seeing overfitting (training loss << validation loss)
+  # --------------------------------------------------------------------------
+  lora_dropout: 0.0
+
+
+# ==============================================================================
+# SECTION 2: Tokenizer Configuration
+# ==============================================================================
+# **WHAT**: Specifies the tokenizer for converting text ↔ token IDs
+# **WHY**: Must match the pretrained model's tokenizer exactly
+# **HOW**: instantiate(cfg.tokenizer) creates tokenizer instance
+# ==============================================================================
+tokenizer:
+  # --------------------------------------------------------------------------
+  # _component_: Tokenizer builder function
+  # --------------------------------------------------------------------------
+  # **WHAT**: Creates a Llama 3 tokenizer (SentencePiece-based)
+  # **IMPORTANT**: Path must point to tokenizer.model from download
+  #
+  # **MODEL FAMILIES USE DIFFERENT TOKENIZERS**:
+  #   - Llama 2/3: llama3_tokenizer (SentencePiece)
+  #   - Gemma: gemma_tokenizer
+  #   - Qwen: qwen2_tokenizer (BPE-based)
+  # --------------------------------------------------------------------------
+  _component_: torchtune.models.llama3.llama3_tokenizer
+
+  # --------------------------------------------------------------------------
+  # path: Location of tokenizer model file
+  # --------------------------------------------------------------------------
+  # **WHAT**: Path to the tokenizer.model file from the pretrained download
+  # **SETUP**: Run this first:
+  #   tune download meta-llama/Meta-Llama-3.1-8B-Instruct \
+  #     --output-dir /tmp/Meta-Llama-3.1-8B-Instruct
+  # --------------------------------------------------------------------------
+  path: /tmp/Meta-Llama-3.1-8B-Instruct/original/tokenizer.model
+
+  # --------------------------------------------------------------------------
+  # max_seq_len: Maximum sequence length for training
+  # --------------------------------------------------------------------------
+  # **WHAT**: null means use model's maximum (131,072 for Llama 3.1)
+  # **WHEN TO SET**: Set to smaller value to reduce memory (e.g., 2048, 4096)
+  #
+  # **MEMORY IMPACT**: Sequence length is LINEAR in memory
+  #   - 2048 tokens: baseline
+  #   - 4096 tokens: 2× memory
+  #   - 8192 tokens: 4× memory
+  # --------------------------------------------------------------------------
+  max_seq_len: null
+
+
+# ==============================================================================
+# SECTION 3: Checkpointer Configuration
+# ==============================================================================
+# **WHAT**: Manages loading pretrained weights and saving fine-tuned checkpoints
+# **WHY**: Need to:
+#   1. Load base model weights to start training
+#   2. Save LoRA adapters during/after training
+#   3. Save optimizer state for resuming training
+# ==============================================================================
+checkpointer:
+  # --------------------------------------------------------------------------
+  # _component_: Checkpointer class
+  # --------------------------------------------------------------------------
+  # **WHAT**: FullModelHFCheckpointer handles HuggingFace format checkpoints
+  # **ALTERNATIVES**:
+  #   - FullModelMetaCheckpointer: For Meta-format checkpoints
+  #   - FullModelTorchTuneCheckpointer: For torchtune-native format
+  #   - DistributedCheckpointer: For multi-GPU training
+  #
+  # See annotated_checkpointer.py for implementation details
+  # --------------------------------------------------------------------------
+  _component_: torchtune.training.FullModelHFCheckpointer
+
+  # --------------------------------------------------------------------------
+  # checkpoint_dir: Where to load pretrained weights FROM
+  # --------------------------------------------------------------------------
+  # **WHAT**: Directory containing the downloaded model weights
+  # **SETUP**: Must run tune download first (see tokenizer section)
+  # --------------------------------------------------------------------------
+  checkpoint_dir: /tmp/Meta-Llama-3.1-8B-Instruct/
+
+  # --------------------------------------------------------------------------
+  # checkpoint_files: Which checkpoint files to load
+  # --------------------------------------------------------------------------
+  # **WHAT**: List of weight files (HF models often split into multiple files)
+  # **HOW TO FIND**: Look in checkpoint_dir for model-*.safetensors files
+  #
+  # **IMPORTANT**: Order doesn't matter (checkpointer handles ordering)
+  # --------------------------------------------------------------------------
+  checkpoint_files: [
+    model-00001-of-00004.safetensors,
+    model-00002-of-00004.safetensors,
+    model-00003-of-00004.safetensors,
+    model-00004-of-00004.safetensors
+  ]
+
+  # --------------------------------------------------------------------------
+  # recipe_checkpoint: Path to recipe state for resuming (optional)
+  # --------------------------------------------------------------------------
+  # **WHAT**: If resuming training, path to recipe_state.pt
+  # **CONTAINS**: Optimizer state, epoch number, random seed, etc.
+  # **TYPICAL**: null (starting new training)
+  # --------------------------------------------------------------------------
+  recipe_checkpoint: null
+
+  # --------------------------------------------------------------------------
+  # output_dir: Where to save checkpoints TO
+  # --------------------------------------------------------------------------
+  # **WHAT**: Checkpoints saved to output_dir/epoch_{N}/
+  # **INTERPOLATION**: ${output_dir} references the global output_dir above
+  #
+  # **STRUCTURE CREATED**:
+  #   /tmp/torchtune/.../lora_single_device/
+  #     ├── epoch_0/
+  #     │   ├── adapter_model.pt          ← LoRA weights
+  #     │   ├── recipe_state.pt           ← Optimizer, etc.
+  #     │   └── *.safetensors             ← Full merged weights (optional)
+  #     └── logs/                         ← Training logs
+  # --------------------------------------------------------------------------
+  output_dir: ${output_dir}
+
+  # --------------------------------------------------------------------------
+  # model_type: Identifier for weight conversion
+  # --------------------------------------------------------------------------
+  # **WHAT**: Tells checkpointer which conversion functions to use
+  # **WHY**: Different models have different weight naming conventions
+  # **OPTIONS**: LLAMA2, LLAMA3, GEMMA, QWEN2, PHI3, etc.
+  # --------------------------------------------------------------------------
+  model_type: LLAMA3
+
+# ------------------------------------------------------------------------------
+# resume_from_checkpoint: Whether to resume interrupted training
+# ------------------------------------------------------------------------------
+# **WHAT**: If True, loads recipe_state.pt and continues training
+# **WHEN**: Training was interrupted (power loss, time limit, etc.)
+# **HOW**: Restores optimizer state, random seed, epoch counter
+#
+# **TYPICAL FLOW**:
+#   1. Start training: resume_from_checkpoint: False
+#   2. Training interrupted at epoch 2
+#   3. Restart: resume_from_checkpoint: True
+#   4. Training continues from epoch 2
+# ------------------------------------------------------------------------------
+resume_from_checkpoint: False
+
+# ------------------------------------------------------------------------------
+# save_adapter_weights_only: Whether to save only LoRA weights
+# ------------------------------------------------------------------------------
+# **WHAT**: If True, only saves adapter_model.pt (small ~10MB file)
+#           If False, saves adapters AND full merged model (large ~16GB file)
+#
+# **TRADEOFF**:
+#   True:  Fast saves, small files, need base model for inference
+#   False: Slow saves, large files, standalone model for inference
+#
+# **TYPICAL**: False (save both for flexibility)
+# ------------------------------------------------------------------------------
+save_adapter_weights_only: False
+
+
+# ==============================================================================
+# SECTION 4: Dataset Configuration
+# ==============================================================================
+# **WHAT**: Specifies which dataset to use for training
+# **HOW**: instantiate(cfg.dataset) creates Dataset instance
+# ==============================================================================
+dataset:
+  # --------------------------------------------------------------------------
+  # _component_: Dataset builder function
+  # --------------------------------------------------------------------------
+  # **WHAT**: alpaca_cleaned_dataset loads the Alpaca instruction dataset
+  # **SOURCE**: yahma/alpaca-cleaned on HuggingFace (auto-downloaded)
+  # **FORMAT**: Instruction-input-output triples
+  #
+  # **OTHER OPTIONS**:
+  #   - torchtune.datasets.alpaca_dataset (original, has some issues)
+  #   - torchtune.datasets.stack_exchange_paired_dataset (for DPO/RLHF)
+  #   - torchtune.datasets.chat_dataset (for conversational data)
+  #   - Your custom dataset!
+  #
+  # See annotated_dataset.py for implementation details
+  # --------------------------------------------------------------------------
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+
+  # --------------------------------------------------------------------------
+  # packed: Whether to pack multiple examples into one sequence
+  # --------------------------------------------------------------------------
+  # **WHAT**: If True, concatenates multiple short examples to fill max_seq_len
+  # **BENEFIT**: Better GPU utilization (less padding)
+  # **COST**: More complex, slight overhead
+  #
+  # **WHEN TO USE**:
+  #   True:  Dataset has many short examples (<512 tokens)
+  #   False: Examples are already long or you want simplicity
+  #
+  # **TYPICAL**: False (simplicity), True for production (efficiency)
+  # --------------------------------------------------------------------------
+  packed: False
+
+# ------------------------------------------------------------------------------
+# Dataset Iteration Settings
+# ------------------------------------------------------------------------------
+# **WHAT**: Control randomness and data order
+# ------------------------------------------------------------------------------
+seed: null          # Random seed (null = random). Set for reproducibility.
+shuffle: True       # Shuffle dataset each epoch (True = better generalization)
+batch_size: 2       # Number of examples per batch (increase for speed)
+
+
+# ==============================================================================
+# SECTION 5: Optimizer Configuration
+# ==============================================================================
+# **WHAT**: Specifies the optimization algorithm
+# **HOW**: instantiate(cfg.optimizer, model.parameters()) creates optimizer
+#          Note: model.parameters() is passed as a positional argument!
+# ==============================================================================
+optimizer:
+  # --------------------------------------------------------------------------
+  # _component_: Optimizer class from PyTorch
+  # --------------------------------------------------------------------------
+  # **WHAT**: torch.optim.AdamW (Adam with decoupled weight decay)
+  # **WHY**: Best default optimizer for LLMs
+  # **ALTERNATIVES**: torch.optim.Adam, torch.optim.SGD
+  # --------------------------------------------------------------------------
+  _component_: torch.optim.AdamW
+
+  # --------------------------------------------------------------------------
+  # fused: Use fused kernel implementation
+  # --------------------------------------------------------------------------
+  # **WHAT**: PyTorch's optimized AdamW kernel (faster on CUDA)
+  # **BENEFIT**: 10-20% speedup on GPU
+  # **REQUIREMENT**: CUDA device
+  # **TYPICAL**: True (unless compatibility issues)
+  # --------------------------------------------------------------------------
+  fused: True
+
+  # --------------------------------------------------------------------------
+  # weight_decay: L2 regularization strength
+  # --------------------------------------------------------------------------
+  # **WHAT**: Penalizes large weights (prevents overfitting)
+  # **TYPICAL**: 0.01 (light regularization) to 0.1 (strong)
+  # **FOR LORA**: 0.01 is usually sufficient (fewer params to overfit)
+  # --------------------------------------------------------------------------
+  weight_decay: 0.01
+
+  # --------------------------------------------------------------------------
+  # lr: Learning rate - THE MOST CRITICAL HYPERPARAMETER
+  # --------------------------------------------------------------------------
+  # **WHAT**: Step size for gradient updates
+  # **TYPICAL FOR LORA**: 1e-4 to 5e-4 (higher than full fine-tuning!)
+  # **WHY HIGHER**: Adapters start at zero, need larger steps to learn
+  #
+  # **TUNING GUIDE**:
+  #   - Too high: Training loss doesn't decrease or oscillates
+  #   - Too low: Training very slow, may not converge in time
+  #   - Just right: Steady decrease in loss
+  #
+  # **COMPARED TO FULL FINE-TUNING**: 10-50× higher
+  #   - Full: 1e-5 to 2e-5
+  #   - LoRA: 1e-4 to 5e-4
+  # --------------------------------------------------------------------------
+  lr: 3e-4
+
+
+# ==============================================================================
+# SECTION 6: Learning Rate Scheduler
+# ==============================================================================
+# **WHAT**: Adjusts learning rate during training
+# **WHY**: Start high for fast learning, decrease for fine convergence
+# ==============================================================================
+lr_scheduler:
+  # --------------------------------------------------------------------------
+  # _component_: Scheduler builder function
+  # --------------------------------------------------------------------------
+  # **WHAT**: Cosine schedule with linear warmup
+  # **SCHEDULE**:
+  #   1. Linear warmup: 0 → lr over num_warmup_steps
+  #   2. Cosine decay: lr → 0 following cosine curve
+  #
+  # **WHY WARMUP**: Prevents instability at start (large gradients)
+  # **WHY COSINE**: Smooth decay, often better than linear
+  # --------------------------------------------------------------------------
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+
+  # --------------------------------------------------------------------------
+  # num_warmup_steps: Steps to linearly increase lr from 0 to lr
+  # --------------------------------------------------------------------------
+  # **TYPICAL**: 100-500 steps (or 5-10% of total steps)
+  # **TRADEOFF**: More warmup = more stable, but slower initial learning
+  # --------------------------------------------------------------------------
+  num_warmup_steps: 100
+
+
+# ==============================================================================
+# SECTION 7: Loss Function
+# ==============================================================================
+# **WHAT**: Defines training objective
+# **HOW**: instantiate(cfg.loss) creates loss function instance
+# ==============================================================================
+loss:
+  # --------------------------------------------------------------------------
+  # _component_: Loss class
+  # --------------------------------------------------------------------------
+  # **WHAT**: LinearCrossEntropyLoss combines:
+  #   1. Output projection (hidden → vocab logits)
+  #   2. Cross-entropy loss
+  #   This fusion saves memory!
+  #
+  # **ALTERNATIVE**: torch.nn.CrossEntropyLoss (if output already projected)
+  # --------------------------------------------------------------------------
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+
+# ==============================================================================
+# SECTION 8: Training Configuration
+# ==============================================================================
+# **WHAT**: Core training hyperparameters
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# epochs: Number of complete passes through the dataset
+# ------------------------------------------------------------------------------
+# **TYPICAL FOR LORA**: 1-3 epochs
+# **WHY SO FEW**: LoRA adapts quickly! More epochs often lead to overfitting
+# **COMPARED TO FULL**: Full fine-tuning often uses 5-10 epochs
+# ------------------------------------------------------------------------------
+epochs: 1
+
+# ------------------------------------------------------------------------------
+# max_steps_per_epoch: Limit steps per epoch (optional)
+# ------------------------------------------------------------------------------
+# **WHAT**: If set, stops epoch after N steps (useful for large datasets)
+# **TYPICAL**: null (train on full dataset)
+# **WHEN TO USE**: Quick experiments, debugging
+# ------------------------------------------------------------------------------
+max_steps_per_epoch: null
+
+# ------------------------------------------------------------------------------
+# gradient_accumulation_steps: Simulate larger batch size
+# ------------------------------------------------------------------------------
+# **WHAT**: Accumulate gradients over N batches before updating weights
+# **FORMULA**: Effective batch size = batch_size × gradient_accumulation_steps
+#
+# **EXAMPLE**: batch_size=2, gradient_accumulation_steps=8
+#              → Effective batch size = 16
+#
+# **WHY**: Larger batch sizes improve training but require more memory.
+#          Gradient accumulation gets the benefits without the memory cost!
+#
+# **TYPICAL**: 4-16 (balance between memory and update frequency)
+# ------------------------------------------------------------------------------
+gradient_accumulation_steps: 8
+
+# ------------------------------------------------------------------------------
+# clip_grad_norm: Gradient clipping threshold
+# ------------------------------------------------------------------------------
+# **WHAT**: If grad norm > threshold, scale down to threshold
+# **WHY**: Prevents training instability from exploding gradients
+# **TYPICAL**: null (no clipping), 1.0, or 5.0
+# **WHEN TO USE**: If seeing loss spikes or NaN losses
+# ------------------------------------------------------------------------------
+clip_grad_norm: null
+
+# ------------------------------------------------------------------------------
+# compile: torch.compile the model + loss
+# ------------------------------------------------------------------------------
+# **WHAT**: PyTorch 2.0+ feature that optimizes model execution
+# **BENEFIT**: 10-30% speedup, 10-20% memory reduction
+# **COST**: Slower first iteration (compilation time)
+# **TYPICAL**: False (for compatibility), True (for production)
+# ------------------------------------------------------------------------------
+compile: False
+
+
+# ==============================================================================
+# SECTION 9: Logging Configuration
+# ==============================================================================
+# **WHAT**: Configure where and how often to log training metrics
+# ==============================================================================
+metric_logger:
+  # --------------------------------------------------------------------------
+  # _component_: Logger class
+  # --------------------------------------------------------------------------
+  # **WHAT**: DiskLogger writes logs to disk (text files)
+  # **ALTERNATIVES**:
+  #   - torchtune.training.metric_logging.WandBLogger (Weights & Biases)
+  #   - torchtune.training.metric_logging.TensorBoardLogger
+  # --------------------------------------------------------------------------
+  _component_: torchtune.training.metric_logging.DiskLogger
+
+  # --------------------------------------------------------------------------
+  # log_dir: Where to write log files
+  # --------------------------------------------------------------------------
+  # **INTERPOLATION**: ${output_dir}/logs resolves to full path
+  # **STRUCTURE**: Creates JSON files with metrics per step
+  # --------------------------------------------------------------------------
+  log_dir: ${output_dir}/logs
+
+# ------------------------------------------------------------------------------
+# Logging Frequency and Level
+# ------------------------------------------------------------------------------
+log_every_n_steps: 1         # Log metrics every N steps (1 = every step)
+log_peak_memory_stats: True  # Log GPU memory usage (useful for optimization)
+log_level: INFO             # Python logging level (DEBUG, INFO, WARN, ERROR)
+
+
+# ==============================================================================
+# SECTION 10: Environment Configuration
+# ==============================================================================
+# **WHAT**: Hardware and precision settings
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# device: Which device to train on
+# ------------------------------------------------------------------------------
+# **WHAT**: cuda (NVIDIA GPU), cpu, mps (Apple Silicon), xpu (Intel GPU)
+# **TYPICAL**: cuda (training on CPU is impractically slow)
+# **REQUIREMENT**: Single-device recipe only supports one GPU
+# ------------------------------------------------------------------------------
+device: cuda
+
+# ------------------------------------------------------------------------------
+# dtype: Training precision
+# ------------------------------------------------------------------------------
+# **WHAT**: Data type for model activations and gradients
+# **OPTIONS**:
+#   - fp32: Full precision (slow, high memory, most accurate)
+#   - bf16: Brain float 16 (fast, half memory, good for LLMs)
+#   - fp16: Half precision (fast, but less stable - NOT RECOMMENDED)
+#
+# **TYPICAL**: bf16 (best balance for modern GPUs)
+# **REQUIREMENT**: bf16 requires Ampere GPUs (RTX 30xx+, A100, H100)
+# ------------------------------------------------------------------------------
+dtype: bf16
+
+
+# ==============================================================================
+# SECTION 11: Memory Optimization
+# ==============================================================================
+# **WHAT**: Techniques to reduce memory usage
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# enable_activation_checkpointing: Trade compute for memory
+# ------------------------------------------------------------------------------
+# **WHAT**: Don't store all activations in forward pass; recompute in backward
+# **BENEFIT**: ~30-50% memory reduction
+# **COST**: ~20-30% slower training (due to recomputation)
+# **TYPICAL**: True (memory is usually the bottleneck, not speed)
+# ------------------------------------------------------------------------------
+enable_activation_checkpointing: True
+
+# ------------------------------------------------------------------------------
+# enable_activation_offloading: Offload activations to CPU
+# ------------------------------------------------------------------------------
+# **WHAT**: Move activations to CPU memory during forward, bring back in backward
+# **BENEFIT**: Large memory reduction (can train much larger batches)
+# **COST**: 30-50% slower (CPU-GPU transfers)
+# **TYPICAL**: False (only enable if OOM even with checkpointing)
+# ------------------------------------------------------------------------------
+enable_activation_offloading: False
+
+
+# ==============================================================================
+# SECTION 12: Profiler Configuration (Advanced)
+# ==============================================================================
+# **WHAT**: PyTorch profiler for performance debugging
+# **TYPICAL**: Disabled (only enable when investigating performance issues)
+# ==============================================================================
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False  # Set to True to enable profiling
+
+  # When enabled, saves trace files here:
+  output_dir: ${output_dir}/profiling_outputs
+
+  # Profile CPU and/or CUDA
+  cpu: True
+  cuda: True
+
+  # What to profile
+  profile_memory: False     # Memory allocations (expensive!)
+  with_stack: False        # Python stack traces (expensive!)
+  record_shapes: True      # Tensor shapes (useful!)
+  with_flops: False       # FLOP counts (expensive!)
+
+  # Profiling schedule (wait, warmup, active steps)
+  wait_steps: 5      # Skip first 5 steps (warmup)
+  warmup_steps: 3    # Profile but don't record next 3
+  active_steps: 2    # Actually record next 2
+  num_cycles: 1      # Repeat schedule once
+
+
+# ==============================================================================
+# SUMMARY: How This Config Drives Training
+# ==============================================================================
+"""
+**COMPLETE FLOW**:
+
+1. USER COMMAND:
+   $ tune run lora_finetune_single_device --config llama3_1/8B_lora_single_device
+
+2. CONFIG LOADING (torchtune/config/_parse.py):
+   - Loads this YAML file
+   - Merges CLI overrides (if any)
+   - Creates DictConfig object
+
+3. RECIPE EXECUTION (recipes/lora_finetune_single_device.py):
+   def main(cfg: DictConfig):
+       # Instantiate components from config
+       model = config.instantiate(cfg.model)
+       tokenizer = config.instantiate(cfg.tokenizer)
+       dataset = config.instantiate(cfg.dataset)
+       optimizer = config.instantiate(cfg.optimizer, model.parameters())
+       lr_scheduler = config.instantiate(cfg.lr_scheduler, optimizer)
+       loss_fn = config.instantiate(cfg.loss)
+
+       # Training loop
+       for epoch in range(cfg.epochs):
+           for batch in dataloader:
+               loss = loss_fn(model(batch), labels)
+               loss.backward()
+               if step % cfg.gradient_accumulation_steps == 0:
+                   optimizer.step()
+                   lr_scheduler.step()
+
+4. CHECKPOINTING:
+   - After each epoch: Save adapter_model.pt + recipe_state.pt
+   - At end: Save final checkpoint
+
+5. OUTPUTS:
+   /tmp/torchtune/llama3_1_8B/lora_single_device/
+     ├── epoch_0/
+     │   ├── adapter_model.pt         ← LoRA weights (~10MB)
+     │   ├── recipe_state.pt          ← Optimizer state
+     │   └── model-*.safetensors      ← Full merged model (optional)
+     └── logs/
+         └── *.json                   ← Training metrics
+
+**KEY INSIGHT**: This entire training run is specified by THIS YAML FILE.
+                 Want to change anything? Edit the YAML, not the code!
+
+**NEXT STEPS**:
+- See annotated_instantiation.py to understand how configs → objects
+- See annotated_model_builders.py to understand what model builders do
+- See Training_Recipe_Lifecycle_Guide.md for the complete training flow
+"""

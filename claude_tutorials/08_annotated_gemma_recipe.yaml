@@ -1,0 +1,411 @@
+# ==============================================================================
+# ANNOTATED: Gemma 2B LoRA Recipe - Cross-Model-Family Compatibility
+# ==============================================================================
+# Source: recipes/configs/gemma/2B_lora.yaml
+#
+# **WHAT**: LoRA fine-tuning for Google's Gemma 2B model
+#
+# **WHY THIS EXAMPLE MATTERS**: Demonstrates torchtune's model-family flexibility!
+#           - Same recipe (lora_finetune_distributed.py) works across models
+#           - Only config changes: model builder + tokenizer + checkpoint paths
+#           - Same architecture patterns (LoRA, datasets, training loop)
+#
+# **GEMMA vs. LLAMA**:
+#   Architecture:
+#     - Similar: Transformer decoder, RoPE, GQA, SwiGLU
+#     - Different: Vocabulary size (256K vs 128K), normalization (RMSNorm placement)
+#
+#   Tokenizer:
+#     - Llama: SentencePiece with 128K vocab
+#     - Gemma: SentencePiece with 256K vocab (larger, more granular)
+#
+#   Model Sizes:
+#     - Llama: 1B, 3B, 8B, 70B, 405B
+#     - Gemma: 2B, 7B (focused on smaller, efficient models)
+#
+# **KEY DIFFERENCES FROM LLAMA RECIPE**:
+#   1. Model builder: gemma vs llama3_1
+#   2. Tokenizer: gemma_tokenizer vs llama3_tokenizer
+#   3. LoRA rank: 64 vs 8 (higher for 2B model)
+#   4. Distributed: Required (vs single device for 8B Llama)
+#   5. Validation: Configured with dataset_val
+#   6. Profiler: Included (optional performance profiling)
+#
+# **RECIPE ENTRY POINT**: recipes/lora_finetune_distributed.py
+# ==============================================================================
+
+output_dir: /tmp/torchtune/gemma_2B/lora
+
+# ==============================================================================
+# Tokenizer: Gemma-Specific (Different from Llama!)
+# ==============================================================================
+# **CRITICAL DIFFERENCE**: Must use gemma_tokenizer for Gemma models
+#
+# **WHY**: Gemma uses 256K vocab (2× larger than Llama's 128K)
+#          Token IDs are incompatible between families!
+#          Using wrong tokenizer → garbage outputs
+#
+# **IMPLEMENTATION**: torchtune/models/gemma/_tokenizer.py
+#                     Still uses SentencePiece, but different vocab file
+# ==============================================================================
+tokenizer:
+  _component_: torchtune.models.gemma.gemma_tokenizer  # ← Gemma-specific!
+  path: /tmp/gemma-2b/tokenizer.model
+
+# ==============================================================================
+# Dataset: Same as Llama (Model-Agnostic!)
+# ==============================================================================
+# **PORTABILITY**: Dataset builders work across all model families
+#                  Only tokenizer needs to change, not dataset code
+#
+# **SPLIT NOTATION**: "train[:95%]" = first 95% for training
+#                     HuggingFace datasets slice syntax
+# ==============================================================================
+dataset:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  packed: False  # Set to True for 20-30% speedup (packs multiple examples)
+  split: train[:95%]  # ← First 95% for training
+
+seed: null
+shuffle: True
+
+# ==============================================================================
+# Validation Dataset (NEW FEATURE!)
+# ==============================================================================
+# **WHAT**: Separate validation split for monitoring overfitting
+#
+# **HOW TO ENABLE**: Set run_val_every_n_steps to integer (e.g., 100)
+#                    Recipe will evaluate on dataset_val every N steps
+#
+# **SPLIT**: train[95%:] = last 5% of training data for validation
+#            Common pattern to avoid downloading separate validation set
+#
+# **CONFIG INTERPOLATION**: ${batch_size} references batch_size from below
+# ==============================================================================
+run_val_every_n_steps: null  # null = disabled, set to 100 to validate every 100 steps
+dataset_val:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  split: train[95%:]  # ← Last 5% for validation
+batch_size_val: ${batch_size}  # Same batch size as training
+
+# ==============================================================================
+# Model: Gemma 2B with LoRA (Higher Rank than Llama!)
+# ==============================================================================
+# **MODEL BUILDER**: torchtune/models/gemma/_model_builders.py
+#
+# **KEY DIFFERENCE**: LoRA rank 64 vs 8 for Llama
+#                     Why higher? 2B model is smaller, needs more LoRA capacity
+#
+# **FORMULA**: lora_alpha = 2 × lora_rank (common heuristic)
+#              Here: 128 = 2 × 64
+#
+# **TRAINABLE PARAMS**: rank × (d_in + d_out) per adapted layer
+#                       For 2B model: ~16M trainable (0.8% of total)
+# ==============================================================================
+model:
+  _component_: torchtune.models.gemma.lora_gemma_2b  # ← Different model family!
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: True
+  lora_rank: 64  # ← Higher than Llama (64 vs 8)
+  lora_alpha: 128  # ← 2× rank
+  lora_dropout: 0.0
+
+# ==============================================================================
+# Checkpointer: Gemma Format (HuggingFace)
+# ==============================================================================
+# **CHECKPOINT FILES**: 2 files for 2B model (vs 4 for 8B Llama)
+#                       Smaller model → fewer shards
+#
+# **MODEL TYPE**: GEMMA (different from LLAMA3)
+#                 Affects weight key mapping during load/save
+# ==============================================================================
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /tmp/gemma-2b/
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,  # ← Only 2 files
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: GEMMA  # ← Must specify for correct weight mapping
+
+resume_from_checkpoint: False
+save_adapter_weights_only: False
+
+# ==============================================================================
+# Optimizer: Lower Learning Rate
+# ==============================================================================
+# **LR**: 2e-5 (lower than Llama's 3e-4)
+#        Why? Smaller model, distributed training → more conservative
+#
+# **FUSED**: True = use fused AdamW kernel (faster on CUDA)
+# ==============================================================================
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  lr: 2e-5  # ← Much lower than Llama (2e-5 vs 3e-4)
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+# ==============================================================================
+# Loss: Same as Llama (Model-Agnostic!)
+# ==============================================================================
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ==============================================================================
+# Training Configuration
+# ==============================================================================
+batch_size: 4
+epochs: 1
+max_steps_per_epoch: null
+gradient_accumulation_steps: 1  # Increase to simulate larger batch size
+clip_grad_norm: null  # Set to 1.0 to clip gradients (stability)
+compile: False  # torch.compile for 20-30% speedup (requires PyTorch 2.0+)
+
+# ==============================================================================
+# Device & Memory
+# ==============================================================================
+device: cuda
+
+# **ACTIVATION CHECKPOINTING**: Trades compute for memory
+#   - Enabled: Recompute activations during backward (saves memory)
+#   - Disabled: Store all activations (faster, more memory)
+#   For 2B model on multiple GPUs, can likely disable
+enable_activation_checkpointing: True
+
+# **ACTIVATION OFFLOADING**: Offload activations to CPU (extreme memory savings)
+#   Rarely needed for 2B model, significant slowdown
+enable_activation_offloading: False
+
+# ==============================================================================
+# Precision: BFloat16 (Recommended)
+# ==============================================================================
+# **BF16 vs FP16**:
+#   - BF16: Better stability, same range as FP32
+#   - FP16: Faster on older GPUs, but can underflow/overflow
+#   For modern GPUs (A100, H100), BF16 is best
+# ==============================================================================
+dtype: bf16
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True
+log_level: INFO  # DEBUG for more verbose, WARN for less
+
+# ==============================================================================
+# Profiler (ADVANCED FEATURE - Usually Disabled)
+# ==============================================================================
+# **WHAT**: PyTorch Profiler for performance analysis
+#
+# **WHEN TO USE**: Diagnosing bottlenecks, optimizing custom kernels
+#                  Not needed for typical fine-tuning
+#
+# **OUTPUT**: Chrome trace JSON (view in chrome://tracing)
+#
+# **SCHEDULE**:
+#   - wait_steps: Skip first N steps (warmup)
+#   - warmup_steps: Warmup profiler
+#   - active_steps: Actively profile
+#   - num_cycles: Repeat schedule
+#
+# **OVERHEAD**: 10-20% slowdown when enabled, large trace files
+# ==============================================================================
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False  # ← Keep disabled unless profiling
+
+  output_dir: ${output_dir}/profiling_outputs
+
+  # Activities to trace
+  cpu: True  # CPU ops (PyTorch Python code)
+  cuda: True  # CUDA kernels (GPU ops)
+
+  # Trace options
+  profile_memory: False  # Track memory allocations (very verbose)
+  with_stack: False  # Include Python stack traces (useful for debugging)
+  record_shapes: True  # Record tensor shapes (helpful for analysis)
+  with_flops: False  # Estimate FLOPS (experimental)
+
+  # Profiling schedule
+  wait_steps: 5  # Skip first 5 steps
+  warmup_steps: 3  # Warmup profiler for 3 steps
+  active_steps: 2  # Profile 2 steps
+  num_cycles: 1  # Run schedule once
+
+# ==============================================================================
+# DISTRIBUTED TRAINING DEEP DIVE
+# ==============================================================================
+"""
+**WHY DISTRIBUTED FOR 2B?**
+
+While 2B model fits on single GPU, distributed training offers:
+1. Data parallelism: Split batches across GPUs (4× throughput)
+2. Larger effective batch size: Better gradient estimates
+3. Faster experimentation: Reduce wall-clock time
+
+**LAUNCH COMMAND**:
+```bash
+tune run --nnodes 1 --nproc_per_node 4 lora_finetune_distributed \
+  --config gemma/2B_lora
+```
+
+Breakdown:
+- `--nnodes 1`: Single machine (multi-machine = 2+)
+- `--nproc_per_node 4`: 4 GPUs on this machine
+- `lora_finetune_distributed`: Recipe with DDP support
+
+**UNDER THE HOOD** (recipes/lora_finetune_distributed.py):
+```python
+import torch.distributed as dist
+
+# Initialize process group
+dist.init_process_group(backend="nccl")  # NCCL for NVIDIA GPUs
+rank = dist.get_rank()  # 0, 1, 2, 3 for 4 GPUs
+
+# Wrap model in DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
+model = DDP(model, device_ids=[rank])
+
+# Training loop
+for batch in dataloader:
+    loss = model(batch)
+    loss.backward()
+    # DDP automatically synchronizes gradients across GPUs!
+    optimizer.step()
+```
+
+**DATA PARALLELISM**:
+```
+GPU 0: Batch [0:4]   ─┐
+GPU 1: Batch [4:8]   ─┼→ Compute gradients
+GPU 2: Batch [8:12]  ─┤   independently
+GPU 3: Batch [12:16] ─┘
+         ↓
+   AllReduce (NCCL)  ← Average gradients
+         ↓
+   All GPUs update weights identically
+```
+
+**EFFECTIVE BATCH SIZE**:
+- Per-GPU batch: 4
+- GPUs: 4
+- Effective batch: 16
+
+With gradient_accumulation_steps=4:
+- Effective batch: 16 × 4 = 64
+
+**MEMORY DISTRIBUTION** (2B model LoRA):
+```
+Model Parameters:     2.0 GB  (per GPU, same copy)
+LoRA Adapters:        0.016 GB (trainable)
+Optimizer States:     0.032 GB (2× adapters for Adam)
+Activations:          1.5 GB  (depends on batch size)
+Total per GPU:        ~3.5 GB (easily fits on 16GB GPU)
+```
+
+**GEMMA MODEL FAMILY COMPARISON**:
+
+┌─────────────┬──────────┬────────────┬─────────────┬──────────────┐
+│ Model       │ Params   │ LoRA Rank  │ GPUs        │ Memory/GPU   │
+├─────────────┼──────────┼────────────┼─────────────┼──────────────┤
+│ Gemma 2B    │ 2B       │ 64         │ 1-4         │ 4-8 GB       │
+│ Gemma 7B    │ 7B       │ 32         │ 2-4         │ 10-16 GB     │
+│ Gemma 2 9B  │ 9B       │ 32         │ 2-8         │ 12-20 GB     │
+│ Gemma 2 27B │ 27B      │ 16         │ 4-8         │ 20-30 GB     │
+└─────────────┴──────────┴────────────┴─────────────┴──────────────┘
+
+**VALIDATION WORKFLOW**:
+
+```python
+# Training step
+for step, batch in enumerate(train_dataloader):
+    loss = train_step(batch)
+
+    # Validation (if enabled)
+    if run_val_every_n_steps and step % run_val_every_n_steps == 0:
+        val_loss = 0
+        for val_batch in val_dataloader:
+            with torch.no_grad():  # No gradients for validation
+                val_loss += compute_loss(model(val_batch))
+
+        log_metric("val_loss", val_loss)
+
+        # Early stopping (optional)
+        if val_loss > best_val_loss:
+            epochs_without_improvement += 1
+```
+
+**PROFILER EXAMPLE OUTPUT**:
+
+When enabled, generates JSON trace viewable in Chrome:
+```
+chrome://tracing
+→ Load trace.json
+→ See timeline:
+  - Python CPU ops (data loading, preprocessing)
+  - CUDA kernels (matmul, attention, etc.)
+  - Memory transfers (host ↔ device)
+
+Identify bottlenecks:
+  - Data loading slow? → More workers, prefetch
+  - Kernel slow? → Try compile=True
+  - Memory transfers? → Pin memory
+```
+
+**CROSS-MODEL-FAMILY PORTABILITY**:
+
+To adapt this config for another model family:
+
+1. Change model builder:
+   ```yaml
+   # Gemma → Qwen
+   model:
+     _component_: torchtune.models.qwen2.lora_qwen2_7b
+   ```
+
+2. Change tokenizer:
+   ```yaml
+   # Gemma → Qwen
+   tokenizer:
+     _component_: torchtune.models.qwen2.qwen2_tokenizer
+   ```
+
+3. Update checkpoint paths:
+   ```yaml
+   checkpointer:
+     checkpoint_dir: /tmp/qwen2-7b/
+     model_type: QWEN2
+   ```
+
+4. Adjust hyperparameters:
+   - LoRA rank (depends on model size)
+   - Learning rate (depends on model architecture)
+   - Batch size (depends on memory)
+
+**EVERYTHING ELSE STAYS THE SAME!**
+- Recipe Python code: Unchanged
+- Dataset: Works across models (tokenizer handles differences)
+- Optimizer, scheduler, loss: Model-agnostic
+- Training loop, checkpointing: Identical
+
+**SUMMARY**:
+This Gemma recipe demonstrates torchtune's key strength:
+- ✅ Model-family flexibility (Gemma, Llama, Qwen, etc.)
+- ✅ Same recipe code across models
+- ✅ Config-driven customization
+- ✅ Distributed training built-in
+- ✅ Validation and profiling support
+
+Perfect example of modular, extensible design!
+"""
+
